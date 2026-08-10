@@ -164,26 +164,38 @@ PY
 
 Use the index that corresponds to the glasses feed.
 
-## 6. Launch
+## 6. Launch (camera in glasses + results on glasses)
 
 ```bash
 source .venv/bin/activate
 cd ~/Viture
 
-python viture_tension_tracker.py --camera-index 1
+python viture_tension_tracker.py --camera-index 1 --device mps --project-glasses
 ```
 
-On Apple Silicon:
+### Project live results onto the glasses
 
-```bash
-python viture_tension_tracker.py --camera-index 1 --device mps
-```
+Viture glasses act as a **USB camera (input)** and a **display / SpaceWalker panel (output)**. This script:
 
-On CPU only:
+1. Reads the built-in Viture UVC camera (`--camera-index`)
+2. Runs hand tracking + PressureVision++ tension estimation
+3. Shows the annotated video with the tension bar
+4. With `--project-glasses` (or press **`f`**), fullscreens that window so you can view it in the glasses
 
-```bash
-python viture_tension_tracker.py --camera-index 1 --device cpu
-```
+Typical macOS flow:
+
+1. Connect Viture over USB and open **SpaceWalker** (or set the glasses as a display)
+2. Grant **Camera** permission to Terminal
+3. Launch with `--project-glasses`
+4. If the fullscreen window appears on the laptop: drag it onto the Viture / SpaceWalker display, then press **`f`** once or twice to fullscreen there
+5. Optional: place the window with coordinates, e.g. `--window-x 1920 --window-y 0` for a monitor to the right of the laptop
+
+Keys while running:
+
+| Key | Action |
+|-----|--------|
+| `q` / Esc | Quit |
+| `f` | Toggle fullscreen glasses projection |
 
 Put the glasses on, look at your hands, and grip something. You should see:
 
@@ -200,6 +212,8 @@ Press **`q`** (or Esc) to quit.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--camera-index` | `1` | OpenCV index for the Viture UVC camera |
+| `--project-glasses` | off | Start fullscreen for live projection onto the glasses |
+| `--window-x` / `--window-y` | unset | Move the OpenCV window onto the Viture monitor |
 | `--weights` | `weights/paper_29.pth` | PressureVision++ checkpoint path |
 | `--device` | auto (`cuda` / `mps` / `cpu`) | Torch device |
 | `--tension-mode` | `peak` | `peak` or `average` pressure → tension % |
@@ -236,6 +250,8 @@ Viture/
 | Slow / laggy | Prefer `--device mps` (Mac) or `--device cuda`; lower `--width`/`--height` |
 | Hands not detected | Improve lighting; keep hands in view; try `--min-detection-confidence 0.3` |
 | `Weights only load failed` / `weights_only` UnpicklingError | Pull the latest branch (`git pull`). The tracker loads the trusted `paper_29.pth` pickle with `weights_only=False` |
+| `module 'mediapipe' has no attribute 'solutions'` | You have MediaPipe 1.x. Pull latest (`git pull`) — the tracker auto-uses Tasks HandLandmarker and downloads `weights/hand_landmarker.task` |
+| `SSL: CERTIFICATE_VERIFY_FAILED` downloading hand model | Pull latest (model is vendored). Or run: `curl -L -o weights/hand_landmarker.task "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"` |
 | `No module named 'pretrainedmodels'` | `python -m pip install pretrainedmodels efficientnet-pytorch timm` (or `python -m pip install -r requirements.txt`) |
 
 ### Stuck on main / local changes block checkout

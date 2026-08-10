@@ -249,13 +249,69 @@ def load_pressurevision_model(
 
 
 def ensure_hand_landmarker_model(task_path: Path = HAND_TASK_PATH) -> Path:
-    """Download MediaPipe HandLandmarker .task model if missing."""
+    """
+    Ensure MediaPipe HandLandmarker .task model exists.
+
+    Prefers a vendored copy under weights/. If missing, downloads via curl
+    (more reliable on macOS Python.org builds than urllib SSL).
+    """
     if task_path.is_file() and task_path.stat().st_size > 1_000_000:
         return task_path
+
     task_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading MediaPipe hand landmarker model to {task_path}...")
-    urllib.request.urlretrieve(HAND_TASK_URL, task_path)
-    return task_path
+
+    # 1) curl — uses system certs on macOS; avoids Python SSL issues
+    import shutil
+    import subprocess
+
+    curl = shutil.which("curl")
+    if curl:
+        try:
+            subprocess.run(
+                [curl, "-L", "--fail", "-o", str(task_path), HAND_TASK_URL],
+                check=True,
+            )
+            if task_path.is_file() and task_path.stat().st_size > 1_000_000:
+                return task_path
+        except (subprocess.CalledProcessError, OSError) as exc:
+            print(f"curl download failed ({exc}); trying Python urllib...")
+
+    # 2) urllib with certifi CA bundle if available
+    try:
+        import ssl
+
+        context = None
+        try:
+            import certifi
+
+            context = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            # Last resort for broken macOS Python.org cert installs.
+            print(
+                "Warning: using unverified SSL context to download hand model "
+                "(macOS Python certificate store often broken)."
+            )
+            context = ssl._create_unverified_context()
+
+        with urllib.request.urlopen(HAND_TASK_URL, context=context) as resp:
+            task_path.write_bytes(resp.read())
+        if task_path.is_file() and task_path.stat().st_size > 1_000_000:
+            return task_path
+    except Exception as exc:
+        if task_path.exists():
+            task_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Failed to download hand_landmarker.task.\n"
+            "Run this manually, then rerun the tracker:\n"
+            f'  curl -L -o "{task_path}" "{HAND_TASK_URL}"\n'
+            f"Original error: {exc}"
+        ) from exc
+
+    raise RuntimeError(
+        f"Downloaded file looks invalid: {task_path}. "
+        f'Re-download with: curl -L -o "{task_path}" "{HAND_TASK_URL}"'
+    )
 
 
 class HandTracker:
