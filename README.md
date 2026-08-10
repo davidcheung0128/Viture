@@ -13,6 +13,23 @@ cd ~
 git clone -b cursor/viture-tension-tracker-4b6d https://github.com/davidcheung0128-ai/Viture.git
 cd Viture
 git submodule update --init --recursive
+ls viture_tension_tracker.py
+```
+
+If `ls` says **No such file or directory**, you are on the wrong branch (often `main`, which only has the README). Fix with:
+
+```bash
+cd ~/Viture
+git fetch origin
+git checkout cursor/viture-tension-tracker-4b6d
+git pull origin cursor/viture-tension-tracker-4b6d
+git submodule update --init --recursive
+ls viture_tension_tracker.py
+```
+
+Then create the venv and install deps:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -195,6 +212,7 @@ Viture/
 
 | Problem | Fix |
 |---------|-----|
+| `can't open file '.../viture_tension_tracker.py'` | You are on `main` or an incomplete clone. Run `git checkout cursor/viture-tension-tracker-4b6d` then `git pull` and confirm with `ls viture_tension_tracker.py` |
 | `fatal: repository '.../edit/...' not found` | You copied a GitHub **web edit** URL. Use `https://github.com/davidcheung0128-ai/Viture.git` with `-b cursor/viture-tension-tracker-4b6d` |
 | `zsh: unknown file attribute: i` / `command not found: #` | Don't paste README comment lines into zsh. Run real commands **one line at a time** |
 | `zsh: command not found: pip` | Activate the venv, then use `python -m pip ...` |
