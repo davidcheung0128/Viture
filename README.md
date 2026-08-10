@@ -226,8 +226,8 @@ Viture/
 | `fatal: repository '.../edit/...' not found` | You copied a GitHub **web edit** URL. Use `https://github.com/davidcheung0128-ai/Viture.git` with `-b cursor/viture-tension-tracker-4b6d` |
 | `zsh: unknown file attribute: i` / `command not found: #` | Don't paste README comment lines into zsh. Run real commands **one line at a time** |
 | `zsh: command not found: pip` | Activate the venv, then use `python -m pip ...` |
+| `Unable to open camera index N` / `not authorized to capture video` | On macOS: System Settings → Privacy & Security → Camera → enable Terminal (or iTerm). Quit other apps using the camera. Re-plug the Viture USB cable. Try `--camera-index 0`, then `2`. |
 | Wrong camera / laptop selfie view | Try `--camera-index 0`, `2`, … until you see the glasses POV |
-| `Unable to open camera index N` | Re-seat USB; quit Zoom/FaceTime/other camera apps; try another index |
 | `zsh: no such file or directory: weights/paper_29.pth` | That path is not a command. Download the file first with the `curl -L -o weights/paper_29.pth "..."` step above |
 | `Model weights not found` | Run the `curl` download into `weights/paper_29.pth`, then `ls -lh weights/paper_29.pth` |
 | Missing `external/...` imports | Run `git submodule update --init --recursive` |
