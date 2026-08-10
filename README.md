@@ -58,8 +58,10 @@ python viture_tension_tracker.py --camera-index 1
 On Apple Silicon Macs, prefer:
 
 ```bash
-python viture_tension_tracker.py --camera-index 1 --device mps
+python viture_tension_tracker.py --camera-index 1 --device mps --project-glasses
 ```
+
+`--project-glasses` fullscreens the analysis so you can show it on the Viture display (see **Project live results onto the glasses** below).
 
 ## What you need
 
