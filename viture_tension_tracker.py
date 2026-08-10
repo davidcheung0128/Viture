@@ -538,15 +538,16 @@ def run_pressure_inference(
     config: SimpleNamespace,
     device: torch.device,
     soft: bool = True,
-) -> Tuple[np.ndarray, dict]:
+    temperature: float = 3.0,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
     """
     Run PressureVision++ on a hand crop.
 
-    Returns (heatmap HxW float, stats dict).
+    Returns (force_heatmap, contact_prob_map, stats).
 
-    soft=True uses probability-weighted expected force instead of hard argmax.
-    Hard argmax often stays stuck on class 0 (no contact) for egocentric FPV,
-    which makes every fingertip read 0%% even while pressing.
+    On out-of-domain RGB, hard argmax is almost always class 0. We decode a
+    temperature-scaled contact-probability map and use that as the primary
+    per-pixel press signal for fingertip readout.
     """
     resized = cv2.resize(
         bgr_crop,
@@ -559,7 +560,6 @@ def run_pressure_inference(
     force_logits = force_logits.float()
 
     thresholds = list(config.FORCE_THRESHOLDS)
-    # Mid-bin scalar for each class (same mapping as classes_to_scalar).
     class_values = []
     for idx, threshold in enumerate(thresholds):
         if idx == 0:
@@ -573,31 +573,87 @@ def run_pressure_inference(
     value_t = torch.tensor(class_values, device=force_logits.device, dtype=torch.float32)
     value_t = value_t.view(1, -1, 1, 1)
 
+    logit_span = float((force_logits.max() - force_logits.min()).item())
+
     if soft:
-        probs = torch.softmax(force_logits, dim=1)
-        # Expected force per pixel (continuous; non-zero even if argmax is class 0).
-        force_scalar = (probs * value_t).sum(dim=1)
-        # Emphasize likely contact: down-weight pure "no contact" probability.
-        p_contact = 1.0 - probs[:, 0].clamp(0.0, 1.0)
-        force_scalar = force_scalar * (0.15 + 0.85 * p_contact)
+        temp = max(float(temperature), 1e-3)
+        probs = torch.softmax(force_logits / temp, dim=1)
+        p_contact = (1.0 - probs[:, 0]).clamp(0.0, 1.0)
+        expected = (probs * value_t).sum(dim=1)
+        contact_map = p_contact
+        force_map = expected * (0.25 + 0.75 * p_contact)
         p_contact_mean = float(p_contact.mean().item())
         p_contact_max = float(p_contact.max().item())
     else:
         force_class = torch.argmax(force_logits, dim=1)
-        force_scalar = classes_to_scalar(force_class, thresholds)
-        p_contact_mean = float((force_class > 0).float().mean().item())
-        p_contact_max = float((force_class > 0).any().item())
+        force_map = classes_to_scalar(force_class, thresholds)
+        contact_map = (force_class > 0).float()
+        p_contact_mean = float(contact_map.mean().item())
+        p_contact_max = float(contact_map.max().item())
 
-    heatmap = force_scalar.detach().cpu().squeeze().numpy().astype(np.float32)
+    force_heatmap = force_map.detach().cpu().squeeze().numpy().astype(np.float32)
+    contact_heatmap = contact_map.detach().cpu().squeeze().numpy().astype(np.float32)
+    force_heatmap = np.nan_to_num(force_heatmap, nan=0.0, posinf=0.0, neginf=0.0)
+    contact_heatmap = np.nan_to_num(contact_heatmap, nan=0.0, posinf=0.0, neginf=0.0)
+
     stats = {
-        "peak": float(heatmap.max()) if heatmap.size else 0.0,
-        "mean": float(heatmap.mean()) if heatmap.size else 0.0,
-        "nonzero": int(np.count_nonzero(heatmap > 1e-4)),
+        "peak": float(force_heatmap.max()) if force_heatmap.size else 0.0,
+        "contact_peak": float(contact_heatmap.max()) if contact_heatmap.size else 0.0,
+        "mean": float(force_heatmap.mean()) if force_heatmap.size else 0.0,
+        "nonzero": int(np.count_nonzero(contact_heatmap > 0.02)),
         "p_contact_mean": p_contact_mean,
         "p_contact_max": p_contact_max,
+        "logit_span": logit_span,
         "soft": soft,
     }
-    return heatmap, stats
+    return force_heatmap, contact_heatmap, stats
+
+
+def _angle_deg(a: NormPoint, b: NormPoint, c: NormPoint) -> float:
+    """Angle ABC in degrees at point b."""
+    ba = np.array([a[0] - b[0], a[1] - b[1]], dtype=np.float64)
+    bc = np.array([c[0] - b[0], c[1] - b[1]], dtype=np.float64)
+    na = np.linalg.norm(ba)
+    nc = np.linalg.norm(bc)
+    if na < 1e-8 or nc < 1e-8:
+        return 180.0
+    cos = float(np.clip(np.dot(ba, bc) / (na * nc), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos)))
+
+
+def pose_finger_press_proxy(
+    points: Sequence[NormPoint],
+    frame_w: int,
+    frame_h: int,
+) -> List[Tuple[str, Tuple[int, int], float, float]]:
+    """
+    Pose-based per-finger effort proxy when PV2 contact is dead.
+
+    Uses finger curl (PIP flexion). NOT true contact Newtons — responds to
+    gripping/pressing postures so the UI is not stuck at 0% without Tekscan data.
+    """
+    chains = (
+        ("Thumb", 1, 2, 3, 4),
+        ("Index", 5, 6, 7, 8),
+        ("Middle", 9, 10, 11, 12),
+        ("Ring", 13, 14, 15, 16),
+        ("Pinky", 17, 18, 19, 20),
+    )
+    out: List[Tuple[str, Tuple[int, int], float, float]] = []
+    if len(points) < 21:
+        return out
+    for name, mcp, pip, dip, tip in chains:
+        ang = _angle_deg(points[mcp], points[pip], points[dip])
+        curl = float(np.clip((165.0 - ang) / 100.0, 0.0, 1.0))
+        tip_y = points[tip][1]
+        wrist_y = points[0][1]
+        planted = float(np.clip((tip_y - wrist_y) * 2.5 + 0.25, 0.0, 0.35))
+        tension = float(np.clip(0.75 * curl + 0.25 * planted, 0.0, 1.0))
+        px = int(round(points[tip][0] * frame_w))
+        py = int(round(points[tip][1] * frame_h))
+        out.append((name, (px, py), tension, tension))
+    return out
+
 
 
 def tension_from_heatmap(
@@ -1325,12 +1381,12 @@ def main() -> int:
 
     print(
         f"Streaming camera {camera_index} | device={device} | "
-        f"max_force={args.max_force} | fpv_adaptive={args.fpv_adaptive} | "
-        f"smooth={args.smooth}."
+        f"gain={args.gain} | fpv_adaptive={args.fpv_adaptive}."
     )
     print(
-        "Per-finger force (no custom dataset): PressureVision++ heatmap → "
-        "soft-assign contact to each fingertip. Press tips on a surface."
+        "Per-finger readout: PressureVision++ contact prob + pose-curl fallback. "
+        "If on-screen src=pose-proxy, pretrained PV2 sees no contact — bars still "
+        "move from finger curl (grip). True press Newtons need Tekscan finetune."
     )
     print("Keys: q=quit | f=toggle fullscreen AFTER dragging window into glasses")
 
@@ -1397,61 +1453,76 @@ def main() -> int:
                             continue
 
                         try:
-                            heatmap, heat_stats = run_pressure_inference(
+                            force_hm, contact_hm, heat_stats = run_pressure_inference(
                                 model,
                                 crop,
                                 config,
                                 device,
                                 soft=not args.hard_argmax,
+                                temperature=3.0,
                             )
-                            if args.gain != 1.0:
-                                heatmap = heatmap * float(args.gain)
                         except Exception as exc:  # keep UI alive on a bad frame
                             print(f"Inference error: {exc}", file=sys.stderr)
-                            zero_tips = [
-                                (name, xy, 0.0, 0.0) for name, xy, _tid in tips
-                            ]
-                            zero_tips = finger_smoother.update(zero_tips)
-                            draw_fingertip_pressures(display, zero_tips)
-                            all_tip_pressures.extend(zero_tips)
+                            tip_pressures = pose_finger_press_proxy(
+                                points, frame_w, frame_h
+                            )
+                            tip_pressures = finger_smoother.update(tip_pressures)
+                            draw_fingertip_pressures(display, tip_pressures)
+                            all_tip_pressures.extend(tip_pressures)
                             continue
 
-                        # PressureVision-style contact overlay + per-finger force.
-                        overlay_heatmap_on_bbox(display, heatmap, bbox, alpha=0.7)
-                        tip_pressures = sample_fingertip_pressures(
-                            heatmap,
+                        # Use contact-probability map for tip forces (0..1).
+                        # Fall back to pose curl when PV2 contact is dead.
+                        overlay_heatmap_on_bbox(
+                            display, contact_hm, bbox, alpha=0.55
+                        )
+                        pv2_tips = sample_fingertip_pressures(
+                            contact_hm * float(args.gain),
                             points,
                             bbox,
                             frame_w,
                             frame_h,
-                            args.max_force,
+                            max_force=1.0,
                         )
-                        # If sampling somehow empty, fall back to landmark zeros.
-                        if not tip_pressures and tips:
-                            tip_pressures = [
-                                (name, xy, 0.0, 0.0) for name, xy, _tid in tips
-                            ]
-                        tip_pressures = finger_smoother.update(tip_pressures)
+                        pose_tips = pose_finger_press_proxy(
+                            points, frame_w, frame_h
+                        )
+                        pv2_alive = heat_stats.get("contact_peak", 0.0) > 0.03
+                        source = "pv2+pose" if pv2_alive else "pose-proxy"
+                        merged: List[Tuple[str, Tuple[int, int], float, float]] = []
+                        pose_by = {n: t for n, _xy, t, _r in pose_tips}
+                        pix_by = {n: xy for n, xy, _t, _r in pose_tips}
+                        for name, pix, tension, raw in pv2_tips:
+                            pix_by[name] = pix
+                            pose_t = pose_by.get(name, 0.0)
+                            if pv2_alive:
+                                t = max(float(tension), 0.65 * float(pose_t))
+                                r = max(float(raw), 0.65 * float(pose_t))
+                            else:
+                                t = float(pose_t)
+                                r = float(pose_t)
+                            merged.append((name, pix_by[name], t, r))
+                        if not merged:
+                            merged = pose_tips
+                        tip_pressures = finger_smoother.update(merged)
                         draw_fingertip_pressures(display, tip_pressures)
                         all_tip_pressures.extend(tip_pressures)
 
-                        tension, _raw = tension_from_heatmap(
-                            heatmap, args.max_force, mode=args.tension_mode
-                        )
-                        tensions.append(tension)
+                        if tip_pressures:
+                            tensions.append(max(t for _n, _xy, t, _r in tip_pressures))
 
-                        # Debug readout so a stuck-at-zero heatmap is obvious.
                         cv2.putText(
                             display,
                             (
-                                f"heat peak={heat_stats['peak']*args.gain:.2f}  "
-                                f"p_contact={heat_stats['p_contact_max']:.2f}  "
-                                f"{'soft' if not args.hard_argmax else 'hard'}"
+                                f"contact={heat_stats.get('contact_peak', 0):.2f}  "
+                                f"p_max={heat_stats['p_contact_max']:.2f}  "
+                                f"logits={heat_stats.get('logit_span', 0):.1f}  "
+                                f"src={source}"
                             ),
                             (16, 128),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.55,
-                            (0, 255, 255) if heat_stats["peak"] > 1e-3 else (0, 0, 255),
+                            (0, 255, 255) if pv2_alive else (0, 165, 255),
                             2,
                             cv2.LINE_AA,
                         )
