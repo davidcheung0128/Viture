@@ -222,6 +222,7 @@ Viture/
 | Problem | Fix |
 |---------|-----|
 | `can't open file '.../viture_tension_tracker.py'` | You are on `main` or an incomplete clone. Run `git checkout cursor/viture-tension-tracker-4b6d` then `git pull` and confirm with `ls viture_tension_tracker.py` |
+| `Your local changes ... would be overwritten by checkout` | Local edits are blocking the branch switch. Force the feature branch (keeps `weights/`): see **Stuck on main** below |
 | `fatal: repository '.../edit/...' not found` | You copied a GitHub **web edit** URL. Use `https://github.com/davidcheung0128-ai/Viture.git` with `-b cursor/viture-tension-tracker-4b6d` |
 | `zsh: unknown file attribute: i` / `command not found: #` | Don't paste README comment lines into zsh. Run real commands **one line at a time** |
 | `zsh: command not found: pip` | Activate the venv, then use `python -m pip ...` |
@@ -232,6 +233,29 @@ Viture/
 | Missing `external/...` imports | Run `git submodule update --init --recursive` |
 | Slow / laggy | Prefer `--device mps` (Mac) or `--device cuda`; lower `--width`/`--height` |
 | Hands not detected | Improve lighting; keep hands in view; try `--min-detection-confidence 0.3` |
+
+### Stuck on main / local changes block checkout
+
+If `git checkout` fails with `Your local changes would be overwritten`, force the feature branch. This discards local git edits but keeps a copied weights file:
+
+```bash
+cd ~/Viture
+cp weights/paper_29.pth /tmp/paper_29.pth
+git fetch origin
+git checkout -f cursor/viture-tension-tracker-4b6d
+git reset --hard origin/cursor/viture-tension-tracker-4b6d
+git submodule update --init --recursive
+mkdir -p weights
+cp /tmp/paper_29.pth weights/paper_29.pth
+ls viture_tension_tracker.py
+```
+
+Then launch:
+
+```bash
+source .venv/bin/activate
+python viture_tension_tracker.py --camera-index 1
+```
 
 ## How it works (short)
 
