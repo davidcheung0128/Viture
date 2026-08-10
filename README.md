@@ -25,7 +25,7 @@ The glasses expose a standard UVC webcam. This repo runs the tracker on a host P
 
 ```bash
 # Clone (if needed) and enter the repo
-git clone <your-repo-url> Viture
+git clone https://github.com/davidcheung0128-ai/Viture/edit/cursor/viture-tension-tracker-4b6d Viture
 cd Viture
 
 # Pull PressureVision++ + segmentation_models.pytorch
