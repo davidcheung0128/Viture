@@ -65,7 +65,20 @@ python viture_tension_tracker.py --camera-index 1 --device mps --project-glasses
 
 **Important:** macOS Continuity Camera often steals index `0`/`1` (your iPhone). Always run `--list-cameras` or `--auto-camera` so you get the Viture UVC device, not the phone.
 
-## What you need
+## Without a custom dataset (what works now)
+
+You can still get **per-fingertip contact force estimates** from first-person RGB using PressureVision++:
+
+1. MediaPipe finds the hand + 5 fingertips  
+2. PressureVision++ predicts a pressure heatmap on the hand crop  
+3. Contact pixels are soft-assigned to each fingertip → Thumb/Index/Middle/Ring/Pinky %  
+4. Adaptive FPV scaling + EMA smoothing make relative presses readable on glasses POV  
+
+```bash
+python viture_tension_tracker.py --camera-index 1 --device mps --project-glasses
+```
+
+Press fingertips on a **table/object** (air = ~0%). This is contact force, not EMG muscle tension. Absolute Newtons will be noisy until you finetune on Tekscan/Orbbec data; **which finger is pressing harder** is what works today.
 
 | Item | Notes |
 |------|--------|

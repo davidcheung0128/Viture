@@ -118,7 +118,25 @@ def parse_args() -> argparse.Namespace:
         "--max-force",
         type=float,
         default=16.0,
-        help="Pressure value mapped to 100%% fingertip force UI (default: 16.0; was 64).",
+        help="Pressure value mapped to 100%% fingertip force UI (default: 16.0).",
+    )
+    parser.add_argument(
+        "--fpv-adaptive",
+        action="store_true",
+        default=True,
+        help="Adaptive egocentric scaling from recent peak tip forces (default on).",
+    )
+    parser.add_argument(
+        "--no-fpv-adaptive",
+        action="store_false",
+        dest="fpv_adaptive",
+        help="Disable adaptive FPV scaling; use fixed --max-force only.",
+    )
+    parser.add_argument(
+        "--smooth",
+        type=float,
+        default=0.65,
+        help="EMA smoothing for per-finger force in [0,1) (default: 0.65).",
     )
     parser.add_argument(
         "--tension-mode",
@@ -729,21 +747,19 @@ def sample_fingertip_pressures(
     max_force: float,
 ) -> List[Tuple[str, Tuple[int, int], float, float]]:
     """
-    Sample PressureVision++ heatmap around each fingertip.
+    Estimate per-fingertip force from a PressureVision++ heatmap.
 
-    Uses a large local-max neighborhood around each tip (and slightly toward
-    the palm) because contact force often peaks on the finger pad, not the
-    exact landmark pixel.
+    Uses distance-weighted soft assignment of contact pixels to the five
+    fingertips (better than a tiny tip patch alone), which is the best we can
+    do from FPV RGB without a custom Tekscan dataset.
     """
     x1, y1, x2, y2 = bbox
     bw = max(x2 - x1, 1)
     bh = max(y2 - y1, 1)
     hh, hw = heatmap.shape[:2]
-    # ~8% of the crop — large enough to catch tip contact blobs.
-    radius = max(14, int(0.08 * min(hh, hw)))
-    out: List[Tuple[str, Tuple[int, int], float, float]] = []
+    hm = heatmap.astype(np.float32)
 
-    # Palm reference (wrist landmark 0) to nudge sample toward the finger pad.
+    tip_px: List[Tuple[str, Tuple[int, int], Tuple[float, float]]] = []
     palm_x = points[0][0] * frame_w if points else 0.0
     palm_y = points[0][1] * frame_h if points else 0.0
 
@@ -753,34 +769,98 @@ def sample_fingertip_pressures(
         nx, ny = points[tip_id]
         px = int(round(nx * frame_w))
         py = int(round(ny * frame_h))
+        # Finger pad: slightly toward palm from the tip landmark.
+        pad_x = px + 0.18 * (palm_x - px)
+        pad_y = py + 0.18 * (palm_y - py)
+        # Heatmap coordinates of the pad center.
+        hx = ((pad_x - x1) / bw) * (hw - 1)
+        hy = ((pad_y - y1) / bh) * (hh - 1)
+        tip_px.append((name, (px, py), (hx, hy)))
 
-        # Nudge 15% from tip toward palm (finger pad).
-        pad_x = px + 0.15 * (palm_x - px)
-        pad_y = py + 0.15 * (palm_y - py)
+    if not tip_px:
+        return []
 
-        def to_heat(fx: float, fy: float) -> Tuple[int, int]:
-            rx = (fx - x1) / bw
-            ry = (fy - y1) / bh
-            hx = int(np.clip(rx * (hw - 1), 0, hw - 1))
-            hy = int(np.clip(ry * (hh - 1), 0, hh - 1))
-            return hx, hy
+    # Soft-assign contact mass to nearest fingertips.
+    peak = float(hm.max()) if hm.size else 0.0
+    thr = max(0.02 * peak, 0.05) if peak > 0 else 1e9
+    raw_forces = np.zeros(len(tip_px), dtype=np.float64)
+    # Influence radius in heatmap pixels (~12% of crop).
+    sigma = max(10.0, 0.12 * min(hh, hw))
+    ys, xs = np.where(hm >= thr)
+    if ys.size:
+        for y, x in zip(ys.tolist(), xs.tolist()):
+            val = float(hm[y, x])
+            dists = []
+            for _name, _pix, (hx, hy) in tip_px:
+                d2 = (x - hx) ** 2 + (y - hy) ** 2
+                dists.append(d2)
+            d2 = np.asarray(dists, dtype=np.float64)
+            w = np.exp(-d2 / (2.0 * sigma * sigma))
+            w_sum = float(w.sum())
+            if w_sum <= 1e-8:
+                continue
+            w /= w_sum
+            raw_forces += w * val
 
-        hx, hy = to_heat(pad_x, pad_y)
-        hx2, hy2 = to_heat(float(px), float(py))
-
-        raw = 0.0
-        for cx, cy in ((hx, hy), (hx2, hy2)):
-            y0 = max(0, cy - radius)
-            y1h = min(hh, cy + radius + 1)
-            x0 = max(0, cx - radius)
-            x1h = min(hw, cx + radius + 1)
-            patch = heatmap[y0:y1h, x0:x1h]
-            if patch.size:
-                raw = max(raw, float(np.max(patch)))
-
+    # Also take a local max near each tip as a floor (catches small contacts).
+    radius = max(12, int(0.07 * min(hh, hw)))
+    out: List[Tuple[str, Tuple[int, int], float, float]] = []
+    for i, (name, pix, (hx, hy)) in enumerate(tip_px):
+        cx, cy = int(round(hx)), int(round(hy))
+        y0 = max(0, cy - radius)
+        y1h = min(hh, cy + radius + 1)
+        x0 = max(0, cx - radius)
+        x1h = min(hw, cx + radius + 1)
+        patch = hm[y0:y1h, x0:x1h]
+        local = float(np.max(patch)) if patch.size else 0.0
+        raw = float(max(raw_forces[i], local))
         tension = float(np.clip(raw / max(max_force, 1e-6), 0.0, 1.0))
-        out.append((name, (px, py), tension, raw))
+        out.append((name, pix, tension, raw))
     return out
+
+
+class FingerForceSmoother:
+    """EMA + adaptive FPV scale so relative tip forces are readable egocentrically."""
+
+    def __init__(self, smooth: float = 0.65, adaptive: bool = True, max_force: float = 16.0):
+        self.smooth = float(np.clip(smooth, 0.0, 0.95))
+        self.adaptive = adaptive
+        self.max_force = max_force
+        self._ema_raw: dict[str, float] = {n: 0.0 for n in FINGERTIP_NAMES}
+        self._peak = max_force * 0.35
+
+    def update(
+        self,
+        tip_pressures: Sequence[Tuple[str, Tuple[int, int], float, float]],
+    ) -> List[Tuple[str, Tuple[int, int], float, float]]:
+        # Update EMA on raw forces.
+        seen = set()
+        for name, pix, _t, raw in tip_pressures:
+            seen.add(name)
+            prev = self._ema_raw.get(name, 0.0)
+            self._ema_raw[name] = self.smooth * prev + (1.0 - self.smooth) * float(raw)
+
+        for name in FINGERTIP_NAMES:
+            if name not in seen:
+                self._ema_raw[name] = self.smooth * self._ema_raw.get(name, 0.0)
+
+        # Adaptive ceiling from recent peaks (FPV absolute scale is unreliable).
+        cur_peak = max(self._ema_raw.values()) if self._ema_raw else 0.0
+        if self.adaptive:
+            self._peak = max(self._peak * 0.995, cur_peak, self.max_force * 0.15)
+            scale = max(self._peak, 1e-3)
+        else:
+            scale = max(self.max_force, 1e-3)
+
+        out: List[Tuple[str, Tuple[int, int], float, float]] = []
+        pix_by_name = {n: (0, 0) for n in FINGERTIP_NAMES}
+        for name, pix, _t, _r in tip_pressures:
+            pix_by_name[name] = pix
+        for name in FINGERTIP_NAMES:
+            raw = self._ema_raw.get(name, 0.0)
+            tension = float(np.clip(raw / scale, 0.0, 1.0))
+            out.append((name, pix_by_name.get(name, (0, 0)), tension, raw))
+        return out
 
 
 def draw_fingertip_pressures(
@@ -1182,14 +1262,20 @@ def main() -> int:
 
     fps_ema = 0.0
     last_t = time.perf_counter()
+    finger_smoother = FingerForceSmoother(
+        smooth=args.smooth,
+        adaptive=args.fpv_adaptive,
+        max_force=args.max_force,
+    )
 
     print(
         f"Streaming camera {camera_index} | device={device} | "
-        f"tension_mode={args.tension_mode} | max_force={args.max_force}."
+        f"max_force={args.max_force} | fpv_adaptive={args.fpv_adaptive} | "
+        f"smooth={args.smooth}."
     )
     print(
-        "Fingertip force needs CONTACT: press fingertips on a table/object. "
-        "Air poses show ~0% (PressureVision++ estimates contact pressure)."
+        "Per-finger force (no custom dataset): PressureVision++ heatmap → "
+        "soft-assign contact to each fingertip. Press tips on a surface."
     )
     print("Keys: q=quit | f=toggle fullscreen AFTER dragging window into glasses")
 
@@ -1240,10 +1326,10 @@ def main() -> int:
                             points, frame_w, frame_h, padding=HAND_PADDING
                         )
                         if bbox is None:
-                            # No crop — still show 0% tip panel from landmarks.
                             zero_tips = [
                                 (name, xy, 0.0, 0.0) for name, xy, _tid in tips
                             ]
+                            zero_tips = finger_smoother.update(zero_tips)
                             draw_fingertip_pressures(display, zero_tips)
                             all_tip_pressures.extend(zero_tips)
                             continue
@@ -1283,6 +1369,7 @@ def main() -> int:
                             tip_pressures = [
                                 (name, xy, 0.0, 0.0) for name, xy, _tid in tips
                             ]
+                        tip_pressures = finger_smoother.update(tip_pressures)
                         draw_fingertip_pressures(display, tip_pressures)
                         all_tip_pressures.extend(tip_pressures)
 
