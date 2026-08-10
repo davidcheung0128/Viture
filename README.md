@@ -39,7 +39,15 @@ python -m pip install -r external/pressurevision2/requirements.txt
 python -m pip install opencv-python mediapipe numpy pyyaml
 ```
 
-Download `paper_29.pth` into `weights/paper_29.pth`, plug in the glasses, then:
+Download `paper_29.pth` into `weights/`:
+
+```bash
+mkdir -p weights
+curl -L -o weights/paper_29.pth "https://www.dropbox.com/scl/fi/0r2koefy7bhr66dffc8z7/paper_29.pth?rlkey=wshcxm8iy8l1qo60oo7khdqjp&dl=1"
+ls -lh weights/paper_29.pth
+```
+
+Plug in the glasses, then:
 
 ```bash
 source .venv/bin/activate
@@ -120,18 +128,19 @@ python -m pip install opencv-python mediapipe numpy pyyaml
 
 ## 4. Download model weights
 
-1. Download `paper_29.pth` from the [PressureVision2 Dropbox link](https://www.dropbox.com/scl/fi/0r2koefy7bhr66dffc8z7/paper_29.pth?rlkey=wshcxm8iy8l1qo60oo7khdqjp&dl=0).
-2. Put it here:
-
-```text
-weights/paper_29.pth
-```
-
-Quick check:
+Create the folder and download the PressureVision++ checkpoint (do **not** type the path alone into the shell — that is not a command):
 
 ```bash
+cd ~/Viture
+mkdir -p weights
+curl -L -o weights/paper_29.pth "https://www.dropbox.com/scl/fi/0r2koefy7bhr66dffc8z7/paper_29.pth?rlkey=wshcxm8iy8l1qo60oo7khdqjp&dl=1"
 ls -lh weights/paper_29.pth
 ```
+
+You should see a large file (hundreds of MB). If `curl` is unavailable:
+
+1. Open the [Dropbox download link](https://www.dropbox.com/scl/fi/0r2koefy7bhr66dffc8z7/paper_29.pth?rlkey=wshcxm8iy8l1qo60oo7khdqjp&dl=1) in a browser.
+2. Move the downloaded file to `~/Viture/weights/paper_29.pth`.
 
 ## 5. Find the Viture camera index
 
@@ -218,7 +227,8 @@ Viture/
 | `zsh: command not found: pip` | Activate the venv, then use `python -m pip ...` |
 | Wrong camera / laptop selfie view | Try `--camera-index 0`, `2`, … until you see the glasses POV |
 | `Unable to open camera index N` | Re-seat USB; quit Zoom/FaceTime/other camera apps; try another index |
-| `Model weights not found` | Put `paper_29.pth` under `weights/` |
+| `zsh: no such file or directory: weights/paper_29.pth` | That path is not a command. Download the file first with the `curl -L -o weights/paper_29.pth "..."` step above |
+| `Model weights not found` | Run the `curl` download into `weights/paper_29.pth`, then `ls -lh weights/paper_29.pth` |
 | Missing `external/...` imports | Run `git submodule update --init --recursive` |
 | Slow / laggy | Prefer `--device mps` (Mac) or `--device cuda`; lower `--width`/`--height` |
 | Hands not detected | Improve lighting; keep hands in view; try `--min-detection-confidence 0.3` |
