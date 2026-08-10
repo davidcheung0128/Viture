@@ -163,17 +163,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--list-cameras",
         action="store_true",
-        help="Probe camera indexes, print brightness, save preview JPEGs, then exit.",
+        help="Probe camera indexes, print names/brightness, save preview JPEGs, then exit.",
     )
     parser.add_argument(
         "--auto-camera",
         action="store_true",
-        help="Pick the first camera index that returns a non-black live frame.",
+        help=(
+            "Auto-pick a non-black camera, skipping iPhone/Continuity Camera "
+            "and preferring names that look like Viture/UVC."
+        ),
     )
     parser.add_argument(
         "--mirror",
         action="store_true",
         help="Horizontally flip the camera feed (sometimes needed for egocentric view).",
+    )
+    parser.add_argument(
+        "--show-skeleton",
+        action="store_true",
+        help="Also draw MediaPipe hand skeleton (off by default; fingertip pressure is shown instead).",
+    )
+    parser.add_argument(
+        "--allow-continuity",
+        action="store_true",
+        help="Allow Continuity Camera / iPhone as a source (skipped by default).",
     )
     return parser.parse_args()
 
@@ -572,13 +585,83 @@ def draw_searching_overlay(frame: np.ndarray) -> None:
     cv2.putText(frame, text, (x, y), font, scale, (0, 200, 255), thickness, cv2.LINE_AA)
 
 
+FINGERTIP_IDS = (4, 8, 12, 16, 20)
+FINGERTIP_NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
+CONTINUITY_NAME_HINTS = (
+    "continuity",
+    "iphone",
+    "ipad",
+    "desk view",
+    "apple vision",
+)
+PREFERRED_NAME_HINTS = ("viture", "uvc", "usb", "webcam", "hd camera", "camera")
+
+
+def macos_avfoundation_camera_names() -> dict[int, str]:
+    """Best-effort map of AVFoundation index -> device name via ffmpeg."""
+    import re
+    import shutil
+    import subprocess
+
+    names: dict[int, str] = {}
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return names
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        text = (proc.stderr or "") + (proc.stdout or "")
+    except OSError:
+        return names
+
+    in_video = False
+    for line in text.splitlines():
+        lower = line.lower()
+        if "avfoundation video devices" in lower:
+            in_video = True
+            continue
+        if in_video and "avfoundation audio devices" in lower:
+            break
+        if not in_video:
+            continue
+        match = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line)
+        if match:
+            names[int(match.group(1))] = match.group(2).strip()
+    return names
+
+
+def camera_name_is_continuity(name: str) -> bool:
+    lower = name.lower()
+    return any(hint in lower for hint in CONTINUITY_NAME_HINTS)
+
+
+def camera_name_preference_score(name: str) -> int:
+    """Higher is better when auto-selecting (Viture-like names win)."""
+    lower = name.lower()
+    if camera_name_is_continuity(lower):
+        return -100
+    score = 0
+    if "viture" in lower:
+        score += 50
+    for hint in PREFERRED_NAME_HINTS:
+        if hint in lower:
+            score += 5
+    if "facetime" in lower or "macbook" in lower:
+        score -= 5
+    return score
+
+
 def overlay_heatmap_on_bbox(
     frame: np.ndarray,
     heatmap: np.ndarray,
     bbox: Tuple[int, int, int, int],
-    alpha: float = 0.45,
+    alpha: float = 0.65,
 ) -> None:
-    """Optional contact visualization inside the hand crop."""
+    """Blend PressureVision++ pressure colormap onto the hand crop (fingertip contact)."""
     x1, y1, x2, y2 = bbox
     region_w = x2 - x1
     region_h = y2 - y1
@@ -589,20 +672,159 @@ def overlay_heatmap_on_bbox(
     peak = float(hm.max()) if hm.size else 0.0
     if peak <= 1e-6:
         return
+
+    # Log-ish stretch so light fingertip presses stay visible.
     norm = np.clip(hm / peak, 0.0, 1.0)
+    norm = np.sqrt(norm)
     color_u8 = (norm * 255).astype(np.uint8)
     color = cv2.applyColorMap(color_u8, cv2.COLORMAP_JET)
     color = cv2.resize(color, (region_w, region_h), interpolation=cv2.INTER_LINEAR)
 
     roi = frame[y1:y2, x1:x2]
     mask = cv2.resize(
-        (hm > 0).astype(np.uint8) * 255,
+        (hm > (0.02 * peak)).astype(np.uint8) * 255,
         (region_w, region_h),
         interpolation=cv2.INTER_NEAREST,
     )
     blended = cv2.addWeighted(roi, 1.0 - alpha, color, alpha, 0.0)
     roi[mask > 0] = blended[mask > 0]
     frame[y1:y2, x1:x2] = roi
+
+
+def sample_fingertip_pressures(
+    heatmap: np.ndarray,
+    points: Sequence[NormPoint],
+    bbox: Tuple[int, int, int, int],
+    frame_w: int,
+    frame_h: int,
+    max_force: float,
+    radius: int = 4,
+) -> List[Tuple[str, Tuple[int, int], float, float]]:
+    """
+    Sample PressureVision++ heatmap around each fingertip landmark.
+
+    Returns list of (name, pixel_xy, tension_01, raw_force).
+    """
+    x1, y1, x2, y2 = bbox
+    bw = max(x2 - x1, 1)
+    bh = max(y2 - y1, 1)
+    hh, hw = heatmap.shape[:2]
+    out: List[Tuple[str, Tuple[int, int], float, float]] = []
+
+    for name, tip_id in zip(FINGERTIP_NAMES, FINGERTIP_IDS):
+        if tip_id >= len(points):
+            continue
+        nx, ny = points[tip_id]
+        px = int(round(nx * frame_w))
+        py = int(round(ny * frame_h))
+
+        rx = (nx * frame_w - x1) / bw
+        ry = (ny * frame_h - y1) / bh
+        hx = int(np.clip(rx * (hw - 1), 0, hw - 1))
+        hy = int(np.clip(ry * (hh - 1), 0, hh - 1))
+
+        y0 = max(0, hy - radius)
+        y1h = min(hh, hy + radius + 1)
+        x0 = max(0, hx - radius)
+        x1h = min(hw, hx + radius + 1)
+        patch = heatmap[y0:y1h, x0:x1h]
+        raw = float(np.max(patch)) if patch.size else 0.0
+        tension = float(np.clip(raw / max(max_force, 1e-6), 0.0, 1.0))
+        out.append((name, (px, py), tension, raw))
+    return out
+
+
+def draw_fingertip_pressures(
+    frame: np.ndarray,
+    tip_pressures: Sequence[Tuple[str, Tuple[int, int], float, float]],
+) -> None:
+    """Draw per-fingertip press strength (how hard each tip is pressing)."""
+    for name, (px, py), tension, _raw in tip_pressures:
+        # Radius grows with press strength.
+        radius = int(8 + 18 * tension)
+        if tension < 0.5:
+            g = 1.0
+            r = tension * 2.0
+        else:
+            r = 1.0
+            g = 1.0 - (tension - 0.5) * 2.0
+        color = (0, int(255 * g), int(255 * r))  # BGR green->yellow->red
+        cv2.circle(frame, (px, py), radius, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, (px, py), radius, (255, 255, 255), 2, cv2.LINE_AA)
+        label = f"{name} {int(round(tension * 100))}%"
+        cv2.putText(
+            frame,
+            label,
+            (px + radius + 4, py + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            label,
+            (px + radius + 4, py + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def draw_finger_pressure_panel(
+    frame: np.ndarray,
+    tip_pressures: Sequence[Tuple[str, Tuple[int, int], float, float]],
+) -> None:
+    """Right-side panel of per-finger press bars."""
+    if not tip_pressures:
+        return
+    h, w = frame.shape[:2]
+    panel_w = 220
+    x0 = w - panel_w - 16
+    y0 = 90
+    cv2.rectangle(frame, (x0 - 8, y0 - 36), (w - 8, y0 + 28 * len(tip_pressures) + 8), (20, 20, 20), -1)
+    cv2.putText(
+        frame,
+        "Fingertip press",
+        (x0, y0 - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    for i, (name, _xy, tension, _raw) in enumerate(tip_pressures):
+        y = y0 + i * 28
+        cv2.putText(
+            frame,
+            name[:5],
+            (x0, y + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        bar_x = x0 + 70
+        bar_w = 110
+        cv2.rectangle(frame, (bar_x, y), (bar_x + bar_w, y + 16), (60, 60, 60), -1)
+        fill = int(bar_w * tension)
+        color = (0, int(255 * (1.0 - tension)), int(255 * tension))
+        if fill > 0:
+            cv2.rectangle(frame, (bar_x, y), (bar_x + fill, y + 16), color, -1)
+        cv2.putText(
+            frame,
+            f"{int(round(tension * 100))}%",
+            (bar_x + bar_w + 6, y + 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def frame_mean_brightness(frame: np.ndarray) -> float:
@@ -640,59 +862,111 @@ def try_open_camera_index(index: int) -> Tuple[Optional[cv2.VideoCapture], Optio
     return None, None, None
 
 
-def list_cameras(max_index: int = 8, preview_dir: Optional[Path] = None) -> int:
+def list_cameras(
+    max_index: int = 8,
+    preview_dir: Optional[Path] = None,
+    allow_continuity: bool = False,
+) -> int:
     """
     Probe camera indexes and write preview JPEGs so the user can find the Viture feed.
     """
     preview_dir = preview_dir or (ROOT / "weights" / "camera_previews")
     preview_dir.mkdir(parents=True, exist_ok=True)
-    print("Probing cameras (plug in Viture first; grant Terminal Camera permission):\n")
+    names = macos_avfoundation_camera_names() if sys.platform == "darwin" else {}
+    print("Probing cameras (plug in Viture; disable Continuity Camera / iPhone):\n")
+    if names:
+        print("AVFoundation device names:")
+        for idx, name in sorted(names.items()):
+            tag = "  [SKIP: iPhone/Continuity]" if camera_name_is_continuity(name) else ""
+            print(f"  [{idx}] {name}{tag}")
+        print()
+
     found = 0
     for index in range(max_index + 1):
+        name = names.get(index, "")
+        continuity = camera_name_is_continuity(name) if name else False
         cap, frame, backend = try_open_camera_index(index)
         if cap is None or frame is None:
-            print(f"  index {index}: closed")
+            label = f" ({name})" if name else ""
+            print(f"  index {index}{label}: closed")
             continue
         brightness = frame_mean_brightness(frame)
         black = is_black_frame(frame)
         preview_path = preview_dir / f"camera_{index}.jpg"
         cv2.imwrite(str(preview_path), frame)
         status = "BLACK/empty?" if black else "OK (has image)"
+        if continuity and not allow_continuity:
+            status += "  [iPhone/Continuity — skip for Viture]"
+        name_bit = f"  name={name!r}" if name else ""
         print(
             f"  index {index}: OPEN  shape={frame.shape}  "
-            f"brightness={brightness:.1f}  {status}  preview={preview_path}"
+            f"brightness={brightness:.1f}  {status}{name_bit}  preview={preview_path}"
         )
         cap.release()
         found += 1
 
     print(
-        "\nOpen the preview JPEGs and pick the index that shows the glasses POV "
-        "(your hands from your eyes), then run:\n"
-        "  python viture_tension_tracker.py --camera-index N --device mps --project-glasses"
+        "\nPick the index that is NOT your iPhone and shows the glasses POV.\n"
+        "Typical: skip Continuity Camera / iPhone, avoid FaceTime HD (laptop).\n"
+        "Then run:\n"
+        "  python viture_tension_tracker.py --camera-index N --device mps --project-glasses\n"
+        "Or:\n"
+        "  python viture_tension_tracker.py --auto-camera --device mps --project-glasses"
     )
     if found == 0:
         print(
-            "\nNo cameras opened. Check: USB cable, Camera permission for Terminal, "
-            "and quit Zoom/FaceTime/SpaceWalker camera preview if they hold the device."
+            "\nNo cameras opened. Check USB, Camera permission, and quit apps "
+            "holding the camera. On Mac: System Settings → Continuity Camera off "
+            "if your iPhone keeps stealing the index."
         )
         return 1
     return 0
 
 
-def find_first_non_black_camera(max_index: int = 8) -> Optional[int]:
+def find_best_camera(
+    max_index: int = 8,
+    allow_continuity: bool = False,
+) -> Optional[int]:
+    """Prefer Viture/UVC-like names; skip Continuity/iPhone unless allowed."""
+    names = macos_avfoundation_camera_names() if sys.platform == "darwin" else {}
+    candidates: List[Tuple[int, int, float, str]] = []  # score, index, brightness, name
+
     for index in range(max_index + 1):
+        name = names.get(index, f"camera-{index}")
+        if camera_name_is_continuity(name) and not allow_continuity:
+            print(f"  skipping index {index} ({name}) — Continuity/iPhone")
+            continue
         cap, frame, _backend = try_open_camera_index(index)
         if cap is None or frame is None:
             continue
         bright = frame_mean_brightness(frame)
         cap.release()
-        if bright >= 8.0:
-            print(f"Auto-selected camera index {index} (brightness={bright:.1f})")
-            return index
-    return None
+        if bright < 8.0:
+            print(f"  skipping index {index} ({name}) — black frame")
+            continue
+        score = camera_name_preference_score(name) + int(bright / 25.0)
+        candidates.append((score, index, bright, name))
+        print(f"  candidate index {index} ({name}) score={score} brightness={bright:.1f}")
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    score, index, bright, name = candidates[0]
+    print(f"Auto-selected camera index {index} ({name}) score={score} brightness={bright:.1f}")
+    return index
 
 
 def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
+    names = macos_avfoundation_camera_names() if sys.platform == "darwin" else {}
+    name = names.get(index, "")
+    if name and camera_name_is_continuity(name):
+        print(
+            f"WARNING: camera index {index} looks like Continuity/iPhone ({name}).\n"
+            "  Run --list-cameras and choose the Viture device, or use --auto-camera.\n"
+            "  To silence this and force Continuity: pass --allow-continuity.",
+            file=sys.stderr,
+        )
+
     cap, frame, backend = try_open_camera_index(index)
     if cap is None or frame is None:
         raise RuntimeError(
@@ -710,21 +984,19 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
             pass
     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    # Re-read after format negotiation.
     ok, frame2 = cap.read()
     sample = frame2 if ok and frame2 is not None else frame
     brightness = frame_mean_brightness(sample)
+    name_bit = f" name={name!r}" if name else ""
     print(
         f"Opened camera index={index} backend={backend} "
-        f"shape={sample.shape} brightness={brightness:.1f}"
+        f"shape={sample.shape} brightness={brightness:.1f}{name_bit}"
     )
     if is_black_frame(sample):
         print(
             "WARNING: camera feed looks black. This is probably NOT the Viture glasses.\n"
-            "  1) Wear/uncover the glasses camera\n"
-            "  2) Run: python viture_tension_tracker.py --list-cameras\n"
-            "  3) Rerun with the index whose preview shows your egocentric view\n"
-            "  4) Or try: --auto-camera",
+            "  Run: python viture_tension_tracker.py --list-cameras\n"
+            "  Then: --camera-index N   or   --auto-camera",
             file=sys.stderr,
         )
     return cap
@@ -803,7 +1075,7 @@ def main() -> int:
     args = parse_args()
 
     if args.list_cameras:
-        return list_cameras()
+        return list_cameras(allow_continuity=args.allow_continuity)
 
     config = build_default_config()
     device = resolve_device(args.device)
@@ -821,11 +1093,12 @@ def main() -> int:
 
     camera_index = args.camera_index
     if args.auto_camera:
-        auto_idx = find_first_non_black_camera()
+        auto_idx = find_best_camera(allow_continuity=args.allow_continuity)
         if auto_idx is None:
             print(
-                "Auto-camera failed: every probed index was closed or black. "
-                "Run --list-cameras after plugging in the Viture glasses.",
+                "Auto-camera failed: no suitable non-Continuity camera found. "
+                "Run --list-cameras after plugging in the Viture glasses. "
+                "Turn off Continuity Camera if your iPhone is selected.",
                 file=sys.stderr,
             )
             return 1
@@ -841,6 +1114,19 @@ def main() -> int:
         return 1
 
     try:
+        # Refuse Continuity/iPhone unless explicitly allowed.
+        if sys.platform == "darwin" and not args.allow_continuity:
+            names = macos_avfoundation_camera_names()
+            cname = names.get(camera_index, "")
+            if cname and camera_name_is_continuity(cname):
+                print(
+                    f"Camera index {camera_index} is {cname!r} (iPhone/Continuity), "
+                    "not the Viture glasses.\n"
+                    "Re-run with --auto-camera, or --list-cameras then --camera-index N.\n"
+                    "Pass --allow-continuity only if you really want the iPhone.",
+                    file=sys.stderr,
+                )
+                return 1
         cap = open_camera(camera_index, args.width, args.height)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
@@ -895,8 +1181,12 @@ def main() -> int:
                 tensions: List[float] = []
 
                 if hands:
+                    all_tip_pressures: List[
+                        Tuple[str, Tuple[int, int], float, float]
+                    ] = []
                     for points in hands:
-                        draw_hand_skeleton(display, points)
+                        if args.show_skeleton:
+                            draw_hand_skeleton(display, points)
                         bbox = landmarks_to_bbox(
                             points, frame_w, frame_h, padding=HAND_PADDING
                         )
@@ -904,7 +1194,8 @@ def main() -> int:
                             continue
 
                         x1, y1, x2, y2 = bbox
-                        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 128), 2)
+                        # Light crop guide only (no skeleton by default).
+                        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 180, 80), 1)
 
                         crop = frame[y1:y2, x1:x2]
                         if crop.size == 0:
@@ -918,14 +1209,39 @@ def main() -> int:
                             print(f"Inference error: {exc}", file=sys.stderr)
                             continue
 
+                        # PressureVision-style fingertip contact overlay.
+                        overlay_heatmap_on_bbox(display, heatmap, bbox, alpha=0.7)
+                        tip_pressures = sample_fingertip_pressures(
+                            heatmap,
+                            points,
+                            bbox,
+                            frame_w,
+                            frame_h,
+                            args.max_force,
+                        )
+                        draw_fingertip_pressures(display, tip_pressures)
+                        all_tip_pressures.extend(tip_pressures)
+
                         tension, _raw = tension_from_heatmap(
                             heatmap, args.max_force, mode=args.tension_mode
                         )
                         tensions.append(tension)
-                        overlay_heatmap_on_bbox(display, heatmap, bbox)
 
-                    if tensions:
-                        draw_tension_bar(display, max(tensions))
+                    if all_tip_pressures:
+                        draw_finger_pressure_panel(display, all_tip_pressures)
+                        # Overall = hardest fingertip press (more intuitive than area avg).
+                        peak_tip = max(t for _n, _xy, t, _r in all_tip_pressures)
+                        draw_tension_bar(
+                            display,
+                            peak_tip,
+                            label="Fingertip Press / Grip Tension",
+                        )
+                    elif tensions:
+                        draw_tension_bar(
+                            display,
+                            max(tensions),
+                            label="Fingertip Press / Grip Tension",
+                        )
                     else:
                         draw_searching_overlay(display)
                 else:

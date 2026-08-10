@@ -61,7 +61,9 @@ On Apple Silicon Macs, prefer:
 python viture_tension_tracker.py --camera-index 1 --device mps --project-glasses
 ```
 
-`--project-glasses` fullscreens the analysis so you can show it on the Viture display (see **Project live results onto the glasses** below).
+`--project-glasses` fullscreens guidance for SpaceWalker (see below).
+
+**Important:** macOS Continuity Camera often steals index `0`/`1` (your iPhone). Always run `--list-cameras` or `--auto-camera` so you get the Viture UVC device, not the phone.
 
 ## What you need
 
@@ -227,8 +229,10 @@ Press **`q`** (or Esc) to quit.
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--camera-index` | `1` | OpenCV index for the Viture UVC camera |
-| `--project-glasses` | off | Start fullscreen for live projection onto the glasses |
-| `--window-x` / `--window-y` | unset | Move the OpenCV window onto the Viture monitor |
+| `--list-cameras` | off | Probe indexes, save preview JPEGs, exit |
+| `--auto-camera` | off | Use first non-black camera feed |
+| `--project-glasses` | off | Print SpaceWalker projection help; press `f` after dragging into glasses |
+| `--window-x` / `--window-y` | unset | Move the OpenCV window onto another monitor |
 | `--weights` | `weights/paper_29.pth` | PressureVision++ checkpoint path |
 | `--device` | auto (`cuda` / `mps` / `cpu`) | Torch device |
 | `--tension-mode` | `peak` | `peak` or `average` pressure → tension % |
@@ -258,7 +262,8 @@ Viture/
 | `zsh: unknown file attribute: i` / `command not found: #` | Don't paste README comment lines into zsh. Run real commands **one line at a time** |
 | `zsh: command not found: pip` | Activate the venv, then use `python -m pip ...` |
 | `Unable to open camera index N` / `not authorized to capture video` | On macOS: System Settings → Privacy & Security → Camera → enable Terminal (or iTerm). Quit other apps using the camera. Re-plug the Viture USB cable. Try `--camera-index 0`, then `2`. |
-| Wrong camera / laptop selfie view | Try `--camera-index 0`, `2`, … until you see the glasses POV |
+| Black window / `Searching for hands...` forever | Wrong camera. Run `--list-cameras`, open previews, rerun with the glasses index (or `--auto-camera`) |
+| Tracker shows on Mac but not in glasses | Open SpaceWalker, pin the tracker window into XR, then press `f` |
 | `zsh: no such file or directory: weights/paper_29.pth` | That path is not a command. Download the file first with the `curl -L -o weights/paper_29.pth "..."` step above |
 | `Model weights not found` | Run the `curl` download into `weights/paper_29.pth`, then `ls -lh weights/paper_29.pth` |
 | Missing `external/...` imports | Run `git submodule update --init --recursive` |
