@@ -143,8 +143,9 @@ def parse_args() -> argparse.Namespace:
         "--project-glasses",
         action="store_true",
         help=(
-            "Fullscreen the analysis window for live projection onto the "
-            "Viture glasses (treat glasses as a display / SpaceWalker window)."
+            "Prepare live projection onto Viture glasses via SpaceWalker / "
+            "extended display. Starts windowed so you can drag onto the glasses, "
+            "then press 'f' to fullscreen there."
         ),
     )
     parser.add_argument(
@@ -158,6 +159,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional window Y position (use to place on the Viture monitor).",
+    )
+    parser.add_argument(
+        "--list-cameras",
+        action="store_true",
+        help="Probe camera indexes, print brightness, save preview JPEGs, then exit.",
+    )
+    parser.add_argument(
+        "--auto-camera",
+        action="store_true",
+        help="Pick the first camera index that returns a non-black live frame.",
+    )
+    parser.add_argument(
+        "--mirror",
+        action="store_true",
+        help="Horizontally flip the camera feed (sometimes needed for egocentric view).",
     )
     return parser.parse_args()
 
@@ -589,32 +605,100 @@ def overlay_heatmap_on_bbox(
     frame[y1:y2, x1:x2] = roi
 
 
-def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
-    # Prefer AVFoundation on macOS / V4L2 on Linux for UVC devices (Viture).
+def frame_mean_brightness(frame: np.ndarray) -> float:
+    if frame is None or frame.size == 0:
+        return 0.0
+    return float(np.mean(frame))
+
+
+def is_black_frame(frame: np.ndarray, threshold: float = 8.0) -> bool:
+    """True when the frame is essentially black / no real camera image."""
+    return frame_mean_brightness(frame) < threshold
+
+
+def preferred_camera_backends() -> List[int]:
     backends: List[int] = []
     if sys.platform == "darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
         backends.append(cv2.CAP_AVFOUNDATION)
     if hasattr(cv2, "CAP_V4L2"):
         backends.append(cv2.CAP_V4L2)
     backends.append(cv2.CAP_ANY)
+    return backends
 
-    cap = None
-    for backend in backends:
+
+def try_open_camera_index(index: int) -> Tuple[Optional[cv2.VideoCapture], Optional[np.ndarray], Optional[int]]:
+    """Try backends for one index; return (cap, first_frame, backend) or (None, None, None)."""
+    for backend in preferred_camera_backends():
         candidate = cv2.VideoCapture(index, backend)
-        if candidate.isOpened():
-            ok, frame = candidate.read()
-            if ok and frame is not None:
-                cap = candidate
-                break
+        if not candidate.isOpened():
             candidate.release()
-        else:
-            candidate.release()
+            continue
+        ok, frame = candidate.read()
+        if ok and frame is not None:
+            return candidate, frame, backend
+        candidate.release()
+    return None, None, None
 
-    if cap is None or not cap.isOpened():
+
+def list_cameras(max_index: int = 8, preview_dir: Optional[Path] = None) -> int:
+    """
+    Probe camera indexes and write preview JPEGs so the user can find the Viture feed.
+    """
+    preview_dir = preview_dir or (ROOT / "weights" / "camera_previews")
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    print("Probing cameras (plug in Viture first; grant Terminal Camera permission):\n")
+    found = 0
+    for index in range(max_index + 1):
+        cap, frame, backend = try_open_camera_index(index)
+        if cap is None or frame is None:
+            print(f"  index {index}: closed")
+            continue
+        brightness = frame_mean_brightness(frame)
+        black = is_black_frame(frame)
+        preview_path = preview_dir / f"camera_{index}.jpg"
+        cv2.imwrite(str(preview_path), frame)
+        status = "BLACK/empty?" if black else "OK (has image)"
+        print(
+            f"  index {index}: OPEN  shape={frame.shape}  "
+            f"brightness={brightness:.1f}  {status}  preview={preview_path}"
+        )
+        cap.release()
+        found += 1
+
+    print(
+        "\nOpen the preview JPEGs and pick the index that shows the glasses POV "
+        "(your hands from your eyes), then run:\n"
+        "  python viture_tension_tracker.py --camera-index N --device mps --project-glasses"
+    )
+    if found == 0:
+        print(
+            "\nNo cameras opened. Check: USB cable, Camera permission for Terminal, "
+            "and quit Zoom/FaceTime/SpaceWalker camera preview if they hold the device."
+        )
+        return 1
+    return 0
+
+
+def find_first_non_black_camera(max_index: int = 8) -> Optional[int]:
+    for index in range(max_index + 1):
+        cap, frame, _backend = try_open_camera_index(index)
+        if cap is None or frame is None:
+            continue
+        bright = frame_mean_brightness(frame)
+        cap.release()
+        if bright >= 8.0:
+            print(f"Auto-selected camera index {index} (brightness={bright:.1f})")
+            return index
+    return None
+
+
+def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
+    cap, frame, backend = try_open_camera_index(index)
+    if cap is None or frame is None:
         raise RuntimeError(
             f"Unable to open camera index {index}. "
-            "Grant Camera permission to Terminal, then try --camera-index 0 "
-            "or verify the Viture UVC device is connected."
+            "Grant Camera permission to Terminal, plug in Viture, then run "
+            "`python viture_tension_tracker.py --list-cameras`."
         )
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -625,7 +709,38 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
         except Exception:
             pass
     cap.set(cv2.CAP_PROP_FPS, 30)
+
+    # Re-read after format negotiation.
+    ok, frame2 = cap.read()
+    sample = frame2 if ok and frame2 is not None else frame
+    brightness = frame_mean_brightness(sample)
+    print(
+        f"Opened camera index={index} backend={backend} "
+        f"shape={sample.shape} brightness={brightness:.1f}"
+    )
+    if is_black_frame(sample):
+        print(
+            "WARNING: camera feed looks black. This is probably NOT the Viture glasses.\n"
+            "  1) Wear/uncover the glasses camera\n"
+            "  2) Run: python viture_tension_tracker.py --list-cameras\n"
+            "  3) Rerun with the index whose preview shows your egocentric view\n"
+            "  4) Or try: --auto-camera",
+            file=sys.stderr,
+        )
     return cap
+
+
+def print_glasses_projection_help() -> None:
+    print(
+        "\n=== Project onto Viture glasses ===\n"
+        "The tracker window opens on your Mac. Viture does NOT auto-mirror it.\n"
+        "Do this:\n"
+        "  1. Open Viture SpaceWalker (or enable the glasses as a display)\n"
+        "  2. Drag the 'Viture Grip Tension Tracker' window into the glasses view\n"
+        "     (SpaceWalker: pin/capture that window into XR)\n"
+        "  3. With that window focused in the glasses, press 'f' to fullscreen\n"
+        "  4. Press 'q' to quit\n"
+    )
 
 
 def setup_projection_window(
@@ -635,27 +750,61 @@ def setup_projection_window(
     window_y: Optional[int],
 ) -> bool:
     """
-    Create the OpenCV window for laptop and/or Viture glasses projection.
+    Create the OpenCV window.
 
-    Returns whether fullscreen glasses projection is currently enabled.
+    Important: do NOT immediately fullscreen on the laptop. Fullscreen on the
+    primary display hides the window from SpaceWalker. Start windowed, let the
+    user drag it into the glasses, then press 'f'.
     """
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, 1280, 720)
     if window_x is not None and window_y is not None:
         cv2.moveWindow(window, window_x, window_y)
-    fullscreen = False
+        print(f"Moved window to ({window_x}, {window_y})")
     if project_glasses:
-        cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        fullscreen = True
-        print(
-            "Glasses projection ON (fullscreen). "
-            "If you still see the laptop screen, drag this window onto the "
-            "Viture display / SpaceWalker panel, then press 'f' again."
-        )
-    return fullscreen
+        print_glasses_projection_help()
+    return False
+
+
+def draw_camera_status(
+    frame: np.ndarray,
+    camera_index: int,
+    brightness: float,
+    black: bool,
+) -> None:
+    msg = f"Camera #{camera_index}  brightness={brightness:.0f}"
+    color = (0, 0, 255) if black else (0, 255, 0)
+    cv2.putText(
+        frame,
+        msg,
+        (16, 96),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    if black:
+        lines = [
+            "BLACK FEED - not using glasses camera",
+            "Run: python viture_tension_tracker.py --list-cameras",
+            "Then: --camera-index N   or   --auto-camera",
+        ]
+        y = frame.shape[0] // 2 + 40
+        for line in lines:
+            (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            x = (frame.shape[1] - tw) // 2
+            cv2.putText(frame, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(frame, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+            y += th + 12
 
 
 def main() -> int:
     args = parse_args()
+
+    if args.list_cameras:
+        return list_cameras()
+
     config = build_default_config()
     device = resolve_device(args.device)
 
@@ -670,6 +819,18 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    camera_index = args.camera_index
+    if args.auto_camera:
+        auto_idx = find_first_non_black_camera()
+        if auto_idx is None:
+            print(
+                "Auto-camera failed: every probed index was closed or black. "
+                "Run --list-cameras after plugging in the Viture glasses.",
+                file=sys.stderr,
+            )
+            return 1
+        camera_index = auto_idx
+
     try:
         model = load_pressurevision_model(args.weights, config, device)
     except FileNotFoundError as exc:
@@ -680,7 +841,7 @@ def main() -> int:
         return 1
 
     try:
-        cap = open_camera(args.camera_index, args.width, args.height)
+        cap = open_camera(camera_index, args.width, args.height)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -702,10 +863,10 @@ def main() -> int:
     last_t = time.perf_counter()
 
     print(
-        f"Streaming camera {args.camera_index} | device={device} | "
+        f"Streaming camera {camera_index} | device={device} | "
         f"tension_mode={args.tension_mode}."
     )
-    print("Keys: q=quit | f=toggle fullscreen (project to glasses)")
+    print("Keys: q=quit | f=toggle fullscreen AFTER dragging window into glasses")
 
     try:
         while True:
@@ -715,47 +876,62 @@ def main() -> int:
                     break
                 continue
 
+            if args.mirror:
+                frame = cv2.flip(frame, 1)
+
+            brightness = frame_mean_brightness(frame)
+            black = is_black_frame(frame)
+
             display = frame.copy()
             frame_h, frame_w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            hands = tracker.process(rgb)
 
-            tensions: List[float] = []
+            # Skip expensive inference on black/invalid camera feeds.
+            if black:
+                draw_searching_overlay(display)
+                draw_camera_status(display, camera_index, brightness, black=True)
+            else:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                hands = tracker.process(rgb)
+                tensions: List[float] = []
 
-            if hands:
-                for points in hands:
-                    draw_hand_skeleton(display, points)
-                    bbox = landmarks_to_bbox(
-                        points, frame_w, frame_h, padding=HAND_PADDING
-                    )
-                    if bbox is None:
-                        continue
+                if hands:
+                    for points in hands:
+                        draw_hand_skeleton(display, points)
+                        bbox = landmarks_to_bbox(
+                            points, frame_w, frame_h, padding=HAND_PADDING
+                        )
+                        if bbox is None:
+                            continue
 
-                    x1, y1, x2, y2 = bbox
-                    cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 128), 2)
+                        x1, y1, x2, y2 = bbox
+                        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 128), 2)
 
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size == 0:
-                        continue
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            continue
 
-                    try:
-                        heatmap = run_pressure_inference(model, crop, config, device)
-                    except Exception as exc:  # keep UI alive on a bad frame
-                        print(f"Inference error: {exc}", file=sys.stderr)
-                        continue
+                        try:
+                            heatmap = run_pressure_inference(
+                                model, crop, config, device
+                            )
+                        except Exception as exc:  # keep UI alive on a bad frame
+                            print(f"Inference error: {exc}", file=sys.stderr)
+                            continue
 
-                    tension, _raw = tension_from_heatmap(
-                        heatmap, args.max_force, mode=args.tension_mode
-                    )
-                    tensions.append(tension)
-                    overlay_heatmap_on_bbox(display, heatmap, bbox)
+                        tension, _raw = tension_from_heatmap(
+                            heatmap, args.max_force, mode=args.tension_mode
+                        )
+                        tensions.append(tension)
+                        overlay_heatmap_on_bbox(display, heatmap, bbox)
 
-                if tensions:
-                    draw_tension_bar(display, max(tensions))
+                    if tensions:
+                        draw_tension_bar(display, max(tensions))
+                    else:
+                        draw_searching_overlay(display)
                 else:
                     draw_searching_overlay(display)
-            else:
-                draw_searching_overlay(display)
+
+                draw_camera_status(display, camera_index, brightness, black=False)
 
             now = time.perf_counter()
             dt = now - last_t
@@ -773,13 +949,18 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
-            if fullscreen:
+            if args.project_glasses:
+                hint = (
+                    "FULLSCREEN IN GLASSES"
+                    if fullscreen
+                    else "Drag window into SpaceWalker, then press f"
+                )
                 cv2.putText(
                     display,
-                    "GLASSES PROJECTION",
+                    hint,
                     (16, 64),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
+                    0.65,
                     (0, 255, 255),
                     2,
                     cv2.LINE_AA,
@@ -794,6 +975,11 @@ def main() -> int:
                 prop = cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL
                 cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, prop)
                 print(f"Fullscreen projection: {'ON' if fullscreen else 'OFF'}")
+                if fullscreen:
+                    print(
+                        "If fullscreen took over the laptop, press f again, "
+                        "drag the window into SpaceWalker/glasses, then press f."
+                    )
     finally:
         tracker.close()
         cap.release()
