@@ -175,27 +175,42 @@ python viture_tension_tracker.py --camera-index 1 --device mps --project-glasses
 
 ### Project live results onto the glasses
 
-Viture glasses act as a **USB camera (input)** and a **display / SpaceWalker panel (output)**. This script:
+Viture glasses are **two separate devices** to the Mac:
 
-1. Reads the built-in Viture UVC camera (`--camera-index`)
-2. Runs hand tracking + PressureVision++ tension estimation
-3. Shows the annotated video with the tension bar
-4. With `--project-glasses` (or press **`f`**), fullscreens that window so you can view it in the glasses
+1. **Camera (input)** — USB webcam selected with `--camera-index`
+2. **Display (output)** — SpaceWalker XR panel / extended monitor
 
-Typical macOS flow:
+`--project-glasses` does **not** auto-mirror into the lenses. It opens a Mac window you must place into SpaceWalker.
 
-1. Connect Viture over USB and open **SpaceWalker** (or set the glasses as a display)
-2. Grant **Camera** permission to Terminal
-3. Launch with `--project-glasses`
-4. If the fullscreen window appears on the laptop: drag it onto the Viture / SpaceWalker display, then press **`f`** once or twice to fullscreen there
-5. Optional: place the window with coordinates, e.g. `--window-x 1920 --window-y 0` for a monitor to the right of the laptop
+#### A) Pick the glasses camera (required)
 
-Keys while running:
+A black “Searching for hands…” window usually means the wrong camera.
 
-| Key | Action |
-|-----|--------|
-| `q` / Esc | Quit |
-| `f` | Toggle fullscreen glasses projection |
+```bash
+python viture_tension_tracker.py --list-cameras
+```
+
+Open JPEGs in `weights/camera_previews/` and pick the **first-person glasses** view:
+
+```bash
+python viture_tension_tracker.py --camera-index N --device mps --project-glasses
+```
+
+Or auto-pick the first non-black camera:
+
+```bash
+python viture_tension_tracker.py --auto-camera --device mps --project-glasses
+```
+
+#### B) Show analysis on the glasses
+
+1. Open **Viture SpaceWalker**
+2. Launch the tracker (window appears on the Mac)
+3. In SpaceWalker, pin/capture **Viture Grip Tension Tracker** into XR
+4. Focus that window and press **`f`** to fullscreen in the glasses
+5. Press **`q`** to quit
+
+If fullscreen takes over the laptop, press **`f`**, drag into SpaceWalker, then **`f`** again.
 
 Put the glasses on, look at your hands, and grip something. You should see:
 
