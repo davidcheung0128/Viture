@@ -51,7 +51,18 @@ from prediction.pred_util import (  # noqa: E402
 DEFAULT_FORCE_THRESHOLDS = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
 NETWORK_IMAGE_SIZE = (448, 448)  # (W, H) for cv2.resize
 DEFAULT_WEIGHTS = ROOT / "weights" / "paper_29.pth"
-HAND_PADDING = 0.20  # 20% margin around landmark AABB
+HAND_PADDING = 0.20  # kept for CLI compatibility; inference uses square PV2-style crop
+HAND_CROP_SCALE = 1.5  # PressureVision++ paper crop scale around hand center
+FINGERTIP_IDS = (4, 8, 12, 16, 20)
+FINGERTIP_NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
+# Distinct BGR colors so each tip is obvious even at 0% force
+FINGERTIP_COLORS = (
+    (255, 100, 50),   # Thumb
+    (0, 165, 255),    # Index
+    (0, 255, 255),    # Middle
+    (0, 255, 0),      # Ring
+    (255, 0, 255),    # Pinky
+)
 
 # MediaPipe hand skeleton edges (landmark index pairs)
 HAND_CONNECTIONS: Sequence[Tuple[int, int]] = (
@@ -106,8 +117,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-force",
         type=float,
-        default=64.0,
-        help="Pressure value mapped to 100%% tension (default: 64.0).",
+        default=16.0,
+        help="Pressure value mapped to 100%% fingertip force UI (default: 16.0; was 64).",
     )
     parser.add_argument(
         "--tension-mode",
@@ -423,29 +434,49 @@ def landmarks_to_bbox(
     frame_w: int,
     frame_h: int,
     padding: float = HAND_PADDING,
+    scale: float = HAND_CROP_SCALE,
 ) -> Optional[Tuple[int, int, int, int]]:
-    """Convert normalized hand landmarks to a padded pixel AABB (x1,y1,x2,y2)."""
+    """
+    Square hand crop matching PressureVision++ (center + radius * scale).
+
+    `padding` is accepted for compatibility; square scale controls the crop.
+    """
     if not points:
         return None
     xs = [p[0] * frame_w for p in points]
     ys = [p[1] * frame_h for p in points]
-
     x_min, x_max = min(xs), max(xs)
     y_min, y_max = min(ys), max(ys)
-    bw = x_max - x_min
-    bh = y_max - y_min
+    cx = 0.5 * (x_min + x_max)
+    cy = 0.5 * (y_min + y_max)
+    radius = max(x_max - cx, y_max - cy, 1.0) * scale
+    # Keep a little extra room from the legacy 20% pad request.
+    radius *= 1.0 + max(0.0, padding) * 0.25
 
-    pad_x = bw * padding
-    pad_y = bh * padding
-
-    x1 = int(max(0, np.floor(x_min - pad_x)))
-    y1 = int(max(0, np.floor(y_min - pad_y)))
-    x2 = int(min(frame_w, np.ceil(x_max + pad_x)))
-    y2 = int(min(frame_h, np.ceil(y_max + pad_y)))
-
+    x1 = int(max(0, np.floor(cx - radius)))
+    y1 = int(max(0, np.floor(cy - radius)))
+    x2 = int(min(frame_w, np.ceil(cx + radius)))
+    y2 = int(min(frame_h, np.ceil(cy + radius)))
     if x2 <= x1 or y2 <= y1:
         return None
     return x1, y1, x2, y2
+
+
+def fingertip_pixels(
+    points: Sequence[NormPoint],
+    frame_w: int,
+    frame_h: int,
+) -> List[Tuple[str, Tuple[int, int], int]]:
+    """Return (name, pixel_xy, tip_landmark_id) for each fingertip."""
+    out: List[Tuple[str, Tuple[int, int], int]] = []
+    for name, tip_id in zip(FINGERTIP_NAMES, FINGERTIP_IDS):
+        if tip_id >= len(points):
+            continue
+        nx, ny = points[tip_id]
+        px = int(round(nx * frame_w))
+        py = int(round(ny * frame_h))
+        out.append((name, (px, py), tip_id))
+    return out
 
 
 def draw_hand_skeleton(
@@ -585,8 +616,6 @@ def draw_searching_overlay(frame: np.ndarray) -> None:
     cv2.putText(frame, text, (x, y), font, scale, (0, 200, 255), thickness, cv2.LINE_AA)
 
 
-FINGERTIP_IDS = (4, 8, 12, 16, 20)
-FINGERTIP_NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 CONTINUITY_NAME_HINTS = (
     "continuity",
     "iphone",
@@ -698,18 +727,25 @@ def sample_fingertip_pressures(
     frame_w: int,
     frame_h: int,
     max_force: float,
-    radius: int = 4,
 ) -> List[Tuple[str, Tuple[int, int], float, float]]:
     """
-    Sample PressureVision++ heatmap around each fingertip landmark.
+    Sample PressureVision++ heatmap around each fingertip.
 
-    Returns list of (name, pixel_xy, tension_01, raw_force).
+    Uses a large local-max neighborhood around each tip (and slightly toward
+    the palm) because contact force often peaks on the finger pad, not the
+    exact landmark pixel.
     """
     x1, y1, x2, y2 = bbox
     bw = max(x2 - x1, 1)
     bh = max(y2 - y1, 1)
     hh, hw = heatmap.shape[:2]
+    # ~8% of the crop — large enough to catch tip contact blobs.
+    radius = max(14, int(0.08 * min(hh, hw)))
     out: List[Tuple[str, Tuple[int, int], float, float]] = []
+
+    # Palm reference (wrist landmark 0) to nudge sample toward the finger pad.
+    palm_x = points[0][0] * frame_w if points else 0.0
+    palm_y = points[0][1] * frame_h if points else 0.0
 
     for name, tip_id in zip(FINGERTIP_NAMES, FINGERTIP_IDS):
         if tip_id >= len(points):
@@ -718,17 +754,30 @@ def sample_fingertip_pressures(
         px = int(round(nx * frame_w))
         py = int(round(ny * frame_h))
 
-        rx = (nx * frame_w - x1) / bw
-        ry = (ny * frame_h - y1) / bh
-        hx = int(np.clip(rx * (hw - 1), 0, hw - 1))
-        hy = int(np.clip(ry * (hh - 1), 0, hh - 1))
+        # Nudge 15% from tip toward palm (finger pad).
+        pad_x = px + 0.15 * (palm_x - px)
+        pad_y = py + 0.15 * (palm_y - py)
 
-        y0 = max(0, hy - radius)
-        y1h = min(hh, hy + radius + 1)
-        x0 = max(0, hx - radius)
-        x1h = min(hw, hx + radius + 1)
-        patch = heatmap[y0:y1h, x0:x1h]
-        raw = float(np.max(patch)) if patch.size else 0.0
+        def to_heat(fx: float, fy: float) -> Tuple[int, int]:
+            rx = (fx - x1) / bw
+            ry = (fy - y1) / bh
+            hx = int(np.clip(rx * (hw - 1), 0, hw - 1))
+            hy = int(np.clip(ry * (hh - 1), 0, hh - 1))
+            return hx, hy
+
+        hx, hy = to_heat(pad_x, pad_y)
+        hx2, hy2 = to_heat(float(px), float(py))
+
+        raw = 0.0
+        for cx, cy in ((hx, hy), (hx2, hy2)):
+            y0 = max(0, cy - radius)
+            y1h = min(hh, cy + radius + 1)
+            x0 = max(0, cx - radius)
+            x1h = min(hw, cx + radius + 1)
+            patch = heatmap[y0:y1h, x0:x1h]
+            if patch.size:
+                raw = max(raw, float(np.max(patch)))
+
         tension = float(np.clip(raw / max(max_force, 1e-6), 0.0, 1.0))
         out.append((name, (px, py), tension, raw))
     return out
@@ -738,40 +787,26 @@ def draw_fingertip_pressures(
     frame: np.ndarray,
     tip_pressures: Sequence[Tuple[str, Tuple[int, int], float, float]],
 ) -> None:
-    """Draw per-fingertip press strength (how hard each tip is pressing)."""
-    for name, (px, py), tension, _raw in tip_pressures:
-        # Radius grows with press strength.
-        radius = int(8 + 18 * tension)
-        if tension < 0.5:
-            g = 1.0
-            r = tension * 2.0
-        else:
-            r = 1.0
-            g = 1.0 - (tension - 0.5) * 2.0
-        color = (0, int(255 * g), int(255 * r))  # BGR green->yellow->red
+    """Draw always-visible fingertip markers + per-tip force %."""
+    for i, (name, (px, py), tension, raw) in enumerate(tip_pressures):
+        base = FINGERTIP_COLORS[i % len(FINGERTIP_COLORS)]
+        # Mix toward red as force rises.
+        color = (
+            int(base[0] * (1.0 - tension) + 0 * tension),
+            int(base[1] * (1.0 - tension) + 0 * tension),
+            int(base[2] * (1.0 - tension) + 255 * tension),
+        )
+        radius = int(12 + 22 * tension)
         cv2.circle(frame, (px, py), radius, color, -1, cv2.LINE_AA)
         cv2.circle(frame, (px, py), radius, (255, 255, 255), 2, cv2.LINE_AA)
-        label = f"{name} {int(round(tension * 100))}%"
-        cv2.putText(
-            frame,
-            label,
-            (px + radius + 4, py + 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 0, 0),
-            3,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            label,
-            (px + radius + 4, py + 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.circle(frame, (px, py), 3, (0, 0, 0), -1, cv2.LINE_AA)
+
+        label = f"{name} {int(round(tension * 100))}% ({raw:.1f})"
+        tx, ty = px - 40, py - radius - 10
+        tx = int(np.clip(tx, 4, frame.shape[1] - 180))
+        ty = int(np.clip(ty, 18, frame.shape[0] - 4))
+        cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(frame, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def draw_finger_pressure_panel(
@@ -1150,7 +1185,11 @@ def main() -> int:
 
     print(
         f"Streaming camera {camera_index} | device={device} | "
-        f"tension_mode={args.tension_mode}."
+        f"tension_mode={args.tension_mode} | max_force={args.max_force}."
+    )
+    print(
+        "Fingertip force needs CONTACT: press fingertips on a table/object. "
+        "Air poses show ~0% (PressureVision++ estimates contact pressure)."
     )
     print("Keys: q=quit | f=toggle fullscreen AFTER dragging window into glasses")
 
@@ -1185,16 +1224,31 @@ def main() -> int:
                         Tuple[str, Tuple[int, int], float, float]
                     ] = []
                     for points in hands:
+                        if len(points) < 21:
+                            # Still mark whatever tips we have.
+                            pass
                         if args.show_skeleton:
                             draw_hand_skeleton(display, points)
+
+                        # Always locate fingertips from MediaPipe first.
+                        tips = fingertip_pixels(points, frame_w, frame_h)
+                        for i, (name, (px, py), _tid) in enumerate(tips):
+                            color = FINGERTIP_COLORS[i % len(FINGERTIP_COLORS)]
+                            cv2.circle(display, (px, py), 10, color, 2, cv2.LINE_AA)
+
                         bbox = landmarks_to_bbox(
                             points, frame_w, frame_h, padding=HAND_PADDING
                         )
                         if bbox is None:
+                            # No crop — still show 0% tip panel from landmarks.
+                            zero_tips = [
+                                (name, xy, 0.0, 0.0) for name, xy, _tid in tips
+                            ]
+                            draw_fingertip_pressures(display, zero_tips)
+                            all_tip_pressures.extend(zero_tips)
                             continue
 
                         x1, y1, x2, y2 = bbox
-                        # Light crop guide only (no skeleton by default).
                         cv2.rectangle(display, (x1, y1), (x2, y2), (0, 180, 80), 1)
 
                         crop = frame[y1:y2, x1:x2]
@@ -1207,9 +1261,14 @@ def main() -> int:
                             )
                         except Exception as exc:  # keep UI alive on a bad frame
                             print(f"Inference error: {exc}", file=sys.stderr)
+                            zero_tips = [
+                                (name, xy, 0.0, 0.0) for name, xy, _tid in tips
+                            ]
+                            draw_fingertip_pressures(display, zero_tips)
+                            all_tip_pressures.extend(zero_tips)
                             continue
 
-                        # PressureVision-style fingertip contact overlay.
+                        # PressureVision-style contact overlay + per-finger force.
                         overlay_heatmap_on_bbox(display, heatmap, bbox, alpha=0.7)
                         tip_pressures = sample_fingertip_pressures(
                             heatmap,
@@ -1219,6 +1278,11 @@ def main() -> int:
                             frame_h,
                             args.max_force,
                         )
+                        # If sampling somehow empty, fall back to landmark zeros.
+                        if not tip_pressures and tips:
+                            tip_pressures = [
+                                (name, xy, 0.0, 0.0) for name, xy, _tid in tips
+                            ]
                         draw_fingertip_pressures(display, tip_pressures)
                         all_tip_pressures.extend(tip_pressures)
 
@@ -1228,9 +1292,17 @@ def main() -> int:
                         tensions.append(tension)
 
                     if all_tip_pressures:
-                        draw_finger_pressure_panel(display, all_tip_pressures)
-                        # Overall = hardest fingertip press (more intuitive than area avg).
-                        peak_tip = max(t for _n, _xy, t, _r in all_tip_pressures)
+                        # One panel entry per finger name (max across hands).
+                        by_name: dict[str, Tuple[str, Tuple[int, int], float, float]] = {}
+                        for item in all_tip_pressures:
+                            name = item[0]
+                            if name not in by_name or item[2] > by_name[name][2]:
+                                by_name[name] = item
+                        ordered = [
+                            by_name[n] for n in FINGERTIP_NAMES if n in by_name
+                        ]
+                        draw_finger_pressure_panel(display, ordered)
+                        peak_tip = max(t for _n, _xy, t, _r in ordered)
                         draw_tension_bar(
                             display,
                             peak_tip,
