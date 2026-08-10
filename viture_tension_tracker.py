@@ -99,8 +99,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera-index",
         type=int,
-        default=1,
-        help="OpenCV camera index for the Viture glasses (default: 1).",
+        default=0,
+        help="OpenCV camera index for the Viture glasses (default: 0).",
     )
     parser.add_argument(
         "--weights",

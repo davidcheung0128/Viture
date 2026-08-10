@@ -163,7 +163,7 @@ Viture is two devices:
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--camera-index N` | `1` | OpenCV camera index |
+| `--camera-index N` | `0` | OpenCV camera index |
 | `--list-cameras` | off | Probe cameras + save preview JPEGs |
 | `--auto-camera` | off | Prefer non-Continuity, non-black camera |
 | `--allow-continuity` | off | Allow iPhone Continuity Camera |
