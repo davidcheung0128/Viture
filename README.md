@@ -233,6 +233,7 @@ Viture/
 | Missing `external/...` imports | Run `git submodule update --init --recursive` |
 | Slow / laggy | Prefer `--device mps` (Mac) or `--device cuda`; lower `--width`/`--height` |
 | Hands not detected | Improve lighting; keep hands in view; try `--min-detection-confidence 0.3` |
+| `Weights only load failed` / `weights_only` UnpicklingError | Pull the latest branch (`git pull`). The tracker loads the trusted `paper_29.pth` pickle with `weights_only=False` |
 
 ### Stuck on main / local changes block checkout
 

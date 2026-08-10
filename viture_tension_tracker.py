@@ -166,7 +166,15 @@ def load_pressurevision_model(
         )
 
     print(f"Loading PressureVision++ weights from {weights_path} on {device}...")
-    checkpoint = torch.load(str(weights_path), map_location=device)
+    # paper_29.pth is a full pickled nn.Module (official PressureVision++ demo format).
+    # PyTorch >= 2.6 defaults weights_only=True, which rejects that pickle.
+    try:
+        checkpoint = torch.load(
+            str(weights_path), map_location=device, weights_only=False
+        )
+    except TypeError:
+        # Older torch without weights_only=
+        checkpoint = torch.load(str(weights_path), map_location=device)
 
     if isinstance(checkpoint, torch.nn.Module):
         model = checkpoint
