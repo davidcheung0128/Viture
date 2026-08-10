@@ -4,6 +4,38 @@ Estimate **grip / muscle tension** from the first-person camera on your Viture X
 
 The glasses expose a standard UVC webcam. Run this tracker on a host Mac/PC while you wear the glasses.
 
+## Quick start
+
+Run **one command per line** in Terminal (do not paste `#` comment lines into zsh):
+
+```bash
+cd ~
+git clone -b cursor/viture-tension-tracker-4b6d https://github.com/davidcheung0128-ai/Viture.git
+cd Viture
+git submodule update --init --recursive
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch torchvision
+python -m pip install -e external/segmentation_models.pytorch
+python -m pip install -r external/pressurevision2/requirements.txt
+python -m pip install opencv-python mediapipe numpy pyyaml
+```
+
+Download `paper_29.pth` into `weights/paper_29.pth`, plug in the glasses, then:
+
+```bash
+source .venv/bin/activate
+cd ~/Viture
+python viture_tension_tracker.py --camera-index 1
+```
+
+On Apple Silicon Macs, prefer:
+
+```bash
+python viture_tension_tracker.py --camera-index 1 --device mps
+```
+
 ## What you need
 
 | Item | Notes |
