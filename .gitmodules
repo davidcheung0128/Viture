@@ -1,0 +1,6 @@
+[submodule "external/pressurevision2"]
+	path = external/pressurevision2
+	url = https://github.com/pgrady3/pressurevision2.git
+[submodule "external/segmentation_models.pytorch"]
+	path = external/segmentation_models.pytorch
+	url = https://github.com/qubvel/segmentation_models.pytorch.git
