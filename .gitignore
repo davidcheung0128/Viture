@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+weights/paper_29.pth
+weights/camera_previews/
+.DS_Store
+*.mkv
+data/sessions/
