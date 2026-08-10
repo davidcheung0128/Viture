@@ -169,12 +169,23 @@ def load_pressurevision_model(
     # paper_29.pth is a full pickled nn.Module (official PressureVision++ demo format).
     # PyTorch >= 2.6 defaults weights_only=True, which rejects that pickle.
     try:
-        checkpoint = torch.load(
-            str(weights_path), map_location=device, weights_only=False
-        )
-    except TypeError:
-        # Older torch without weights_only=
-        checkpoint = torch.load(str(weights_path), map_location=device)
+        try:
+            checkpoint = torch.load(
+                str(weights_path), map_location=device, weights_only=False
+            )
+        except TypeError:
+            # Older torch without weights_only=
+            checkpoint = torch.load(str(weights_path), map_location=device)
+    except ModuleNotFoundError as exc:
+        missing = exc.name or str(exc)
+        raise ModuleNotFoundError(
+            f"Missing dependency {missing!r} while unpickling {weights_path}. "
+            "The official PressureVision++ checkpoint needs the legacy encoder "
+            "stack. Install with:\n"
+            "  python -m pip install pretrainedmodels efficientnet-pytorch timm\n"
+            "Or:\n"
+            "  python -m pip install -r requirements.txt"
+        ) from exc
 
     if isinstance(checkpoint, torch.nn.Module):
         model = checkpoint

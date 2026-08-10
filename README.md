@@ -36,7 +36,7 @@ python -m pip install --upgrade pip
 python -m pip install torch torchvision
 python -m pip install -e external/segmentation_models.pytorch
 python -m pip install -r external/pressurevision2/requirements.txt
-python -m pip install opencv-python mediapipe numpy pyyaml
+python -m pip install -r requirements.txt
 ```
 
 Download `paper_29.pth` into `weights/`:
@@ -123,7 +123,7 @@ Then install the project dependencies:
 ```bash
 python -m pip install -e external/segmentation_models.pytorch
 python -m pip install -r external/pressurevision2/requirements.txt
-python -m pip install opencv-python mediapipe numpy pyyaml
+python -m pip install -r requirements.txt
 ```
 
 ## 4. Download model weights
@@ -234,6 +234,7 @@ Viture/
 | Slow / laggy | Prefer `--device mps` (Mac) or `--device cuda`; lower `--width`/`--height` |
 | Hands not detected | Improve lighting; keep hands in view; try `--min-detection-confidence 0.3` |
 | `Weights only load failed` / `weights_only` UnpicklingError | Pull the latest branch (`git pull`). The tracker loads the trusted `paper_29.pth` pickle with `weights_only=False` |
+| `No module named 'pretrainedmodels'` | `python -m pip install pretrainedmodels efficientnet-pytorch timm` (or `python -m pip install -r requirements.txt`) |
 
 ### Stuck on main / local changes block checkout
 

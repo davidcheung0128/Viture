@@ -1,0 +1,11 @@
+# Host-side deps for viture_tension_tracker.py
+torch
+torchvision
+opencv-python
+mediapipe
+numpy
+pyyaml
+# Needed to unpickle official paper_29.pth (SE-ResNeXt via old SMP stack)
+pretrainedmodels
+efficientnet-pytorch
+timm
