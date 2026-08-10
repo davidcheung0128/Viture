@@ -135,8 +135,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--smooth",
         type=float,
-        default=0.65,
-        help="EMA smoothing for per-finger force in [0,1) (default: 0.65).",
+        default=0.5,
+        help="EMA smoothing for per-finger force in [0,1) (default: 0.5).",
+    )
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=3.0,
+        help="Multiply decoded pressure before tip assignment (default: 3.0).",
+    )
+    parser.add_argument(
+        "--hard-argmax",
+        action="store_true",
+        help="Use hard class argmax (often stuck at 0 on FPV). Default is soft expected force.",
     )
     parser.add_argument(
         "--tension-mode",
@@ -526,23 +537,67 @@ def run_pressure_inference(
     bgr_crop: np.ndarray,
     config: SimpleNamespace,
     device: torch.device,
-) -> np.ndarray:
+    soft: bool = True,
+) -> Tuple[np.ndarray, dict]:
     """
     Run PressureVision++ on a hand crop.
 
-    Returns a HxW float pressure heatmap in the crop's resized space.
+    Returns (heatmap HxW float, stats dict).
+
+    soft=True uses probability-weighted expected force instead of hard argmax.
+    Hard argmax often stays stuck on class 0 (no contact) for egocentric FPV,
+    which makes every fingertip read 0%% even while pressing.
     """
     resized = cv2.resize(
         bgr_crop,
         (config.NETWORK_IMAGE_SIZE_X, config.NETWORK_IMAGE_SIZE_Y),
         interpolation=cv2.INTER_LINEAR,
     )
-    batch = preprocess_hand_crop(resized).to(device)
+    batch = preprocess_hand_crop(resized).to(device=device, dtype=torch.float32)
     outputs = model(batch)
     force_logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-    force_class = torch.argmax(force_logits, dim=1)
-    force_scalar = classes_to_scalar(force_class, config.FORCE_THRESHOLDS)
-    return force_scalar.detach().cpu().squeeze().numpy()
+    force_logits = force_logits.float()
+
+    thresholds = list(config.FORCE_THRESHOLDS)
+    # Mid-bin scalar for each class (same mapping as classes_to_scalar).
+    class_values = []
+    for idx, threshold in enumerate(thresholds):
+        if idx == 0:
+            class_values.append(float(thresholds[0]))
+        elif idx == len(thresholds) - 1:
+            class_values.append(
+                float(thresholds[-1] + (thresholds[-1] - thresholds[-2]) / 2.0)
+            )
+        else:
+            class_values.append(float((thresholds[idx] + thresholds[idx + 1]) / 2.0))
+    value_t = torch.tensor(class_values, device=force_logits.device, dtype=torch.float32)
+    value_t = value_t.view(1, -1, 1, 1)
+
+    if soft:
+        probs = torch.softmax(force_logits, dim=1)
+        # Expected force per pixel (continuous; non-zero even if argmax is class 0).
+        force_scalar = (probs * value_t).sum(dim=1)
+        # Emphasize likely contact: down-weight pure "no contact" probability.
+        p_contact = 1.0 - probs[:, 0].clamp(0.0, 1.0)
+        force_scalar = force_scalar * (0.15 + 0.85 * p_contact)
+        p_contact_mean = float(p_contact.mean().item())
+        p_contact_max = float(p_contact.max().item())
+    else:
+        force_class = torch.argmax(force_logits, dim=1)
+        force_scalar = classes_to_scalar(force_class, thresholds)
+        p_contact_mean = float((force_class > 0).float().mean().item())
+        p_contact_max = float((force_class > 0).any().item())
+
+    heatmap = force_scalar.detach().cpu().squeeze().numpy().astype(np.float32)
+    stats = {
+        "peak": float(heatmap.max()) if heatmap.size else 0.0,
+        "mean": float(heatmap.mean()) if heatmap.size else 0.0,
+        "nonzero": int(np.count_nonzero(heatmap > 1e-4)),
+        "p_contact_mean": p_contact_mean,
+        "p_contact_max": p_contact_max,
+        "soft": soft,
+    }
+    return heatmap, stats
 
 
 def tension_from_heatmap(
@@ -782,7 +837,7 @@ def sample_fingertip_pressures(
 
     # Soft-assign contact mass to nearest fingertips.
     peak = float(hm.max()) if hm.size else 0.0
-    thr = max(0.02 * peak, 0.05) if peak > 0 else 1e9
+    thr = max(peak * 0.01, 1e-6) if peak > 0 else 1e9
     raw_forces = np.zeros(len(tip_px), dtype=np.float64)
     # Influence radius in heatmap pixels (~12% of crop).
     sigma = max(10.0, 0.12 * min(hh, hw))
@@ -827,7 +882,7 @@ class FingerForceSmoother:
         self.adaptive = adaptive
         self.max_force = max_force
         self._ema_raw: dict[str, float] = {n: 0.0 for n in FINGERTIP_NAMES}
-        self._peak = max_force * 0.35
+        self._peak = max(max_force * 0.08, 0.5)
 
     def update(
         self,
@@ -847,7 +902,7 @@ class FingerForceSmoother:
         # Adaptive ceiling from recent peaks (FPV absolute scale is unreliable).
         cur_peak = max(self._ema_raw.values()) if self._ema_raw else 0.0
         if self.adaptive:
-            self._peak = max(self._peak * 0.995, cur_peak, self.max_force * 0.15)
+            self._peak = max(self._peak * 0.998, cur_peak, self.max_force * 0.05)
             scale = max(self._peak, 1e-3)
         else:
             scale = max(self.max_force, 1e-3)
@@ -1342,14 +1397,21 @@ def main() -> int:
                             continue
 
                         try:
-                            heatmap = run_pressure_inference(
-                                model, crop, config, device
+                            heatmap, heat_stats = run_pressure_inference(
+                                model,
+                                crop,
+                                config,
+                                device,
+                                soft=not args.hard_argmax,
                             )
+                            if args.gain != 1.0:
+                                heatmap = heatmap * float(args.gain)
                         except Exception as exc:  # keep UI alive on a bad frame
                             print(f"Inference error: {exc}", file=sys.stderr)
                             zero_tips = [
                                 (name, xy, 0.0, 0.0) for name, xy, _tid in tips
                             ]
+                            zero_tips = finger_smoother.update(zero_tips)
                             draw_fingertip_pressures(display, zero_tips)
                             all_tip_pressures.extend(zero_tips)
                             continue
@@ -1377,6 +1439,22 @@ def main() -> int:
                             heatmap, args.max_force, mode=args.tension_mode
                         )
                         tensions.append(tension)
+
+                        # Debug readout so a stuck-at-zero heatmap is obvious.
+                        cv2.putText(
+                            display,
+                            (
+                                f"heat peak={heat_stats['peak']*args.gain:.2f}  "
+                                f"p_contact={heat_stats['p_contact_max']:.2f}  "
+                                f"{'soft' if not args.hard_argmax else 'hard'}"
+                            ),
+                            (16, 128),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (0, 255, 255) if heat_stats["peak"] > 1e-3 else (0, 0, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
 
                     if all_tip_pressures:
                         # One panel entry per finger name (max across hands).
