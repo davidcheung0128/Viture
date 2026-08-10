@@ -1,6 +1,6 @@
 # Viture Grip Tension Tracker
 
-Live **per-fingertip press / grip** readout from a camera (Viture XR glasses or desk webcam), using MediaPipe hand tracking + [PressureVision++](https://github.com/pgrady3/pressurevision2).
+Live **per-fingertip press / grip** readout from a camera (Viture XR glasses or desk webcam), using MediaPipe hand tracking 
 
 **What you get today (no custom Tekscan dataset required):**
 
@@ -105,23 +105,20 @@ cp /tmp/paper_29.pth weights/paper_29.pth
 
 ## Everyday launch
 
-### A. Pick the correct camera (skip iPhone Continuity)
-
 ```bash
 cd ~/Viture
 source .venv/bin/activate
-python viture_tension_tracker.py --list-cameras
+git fetch origin
+git checkout cursor/viture-tension-tracker-4b6d
+git pull origin cursor/viture-tension-tracker-4b6d
+git submodule update --init --recursive
+ls viture_tension_tracker.py
 ```
 
-Open the JPEGs in `weights/camera_previews/`.
-
-- Skip **iPhone / Continuity Camera**
-- Prefer the **Viture** first-person view (or your desk webcam if testing on a laptop)
-
-Then:
+### A. Pick the correct camera (skip iPhone Continuity)
 
 ```bash
-python viture_tension_tracker.py --camera-index N --device mps --project-glasses
+python viture_tension_tracker.py --camera-index 0 --device mps --project-glasses
 ```
 
 Or:
