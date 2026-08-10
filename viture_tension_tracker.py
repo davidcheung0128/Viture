@@ -141,8 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gain",
         type=float,
-        default=3.0,
-        help="Multiply decoded pressure before tip assignment (default: 3.0).",
+        default=2.0,
+        help="Multiply contact-probability map before tip assignment (default: 2.0).",
     )
     parser.add_argument(
         "--hard-argmax",
@@ -387,7 +387,7 @@ class HandTracker:
     """
     Hands tracker compatible with MediaPipe 1.0 Tasks and legacy solutions API.
 
-    Returns a list of hands; each hand is a list of normalized (x, y) points.
+    Returns a list of (hand_label, points) where hand_label is "Left" or "Right".
     """
 
     def __init__(
@@ -431,25 +431,82 @@ class HandTracker:
         self._mode = "tasks"
         print("Using MediaPipe Tasks HandLandmarker API (mediapipe 1.x).")
 
-    def process(self, rgb_frame: np.ndarray) -> List[List[NormPoint]]:
+    @staticmethod
+    def _normalize_hand_label(label: str) -> str:
+        lower = (label or "").strip().lower()
+        if "left" in lower:
+            return "Left"
+        if "right" in lower:
+            return "Right"
+        return "Hand"
+
+    def process(
+        self, rgb_frame: np.ndarray
+    ) -> List[Tuple[str, List[NormPoint]]]:
         if self._mode == "solutions":
             assert self._legacy_hands is not None
             results = self._legacy_hands.process(rgb_frame)
-            hands: List[List[NormPoint]] = []
+            hands: List[Tuple[str, List[NormPoint]]] = []
             if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    hands.append([(lm.x, lm.y) for lm in hand_landmarks.landmark])
-            return hands
+                handedness = results.multi_handedness or []
+                for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+                    label = "Hand"
+                    if i < len(handedness) and handedness[i].classification:
+                        label = self._normalize_hand_label(
+                            handedness[i].classification[0].label
+                        )
+                    # MediaPipe solutions assumes mirrored selfie view; for a
+                    # normal webcam/desk view the Left/Right labels are swapped.
+                    if label == "Left":
+                        label = "Right"
+                    elif label == "Right":
+                        label = "Left"
+                    points = [(lm.x, lm.y) for lm in hand_landmarks.landmark]
+                    hands.append((label, points))
+            return self._dedupe_hand_labels(hands)
 
         assert self._landmarker is not None
-        # Monotonic timestamps required for VIDEO mode.
         self._frame_ts_ms += 33
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
         result = self._landmarker.detect_for_video(mp_image, self._frame_ts_ms)
         hands = []
-        for hand_landmarks in result.hand_landmarks:
-            hands.append([(lm.x, lm.y) for lm in hand_landmarks])
-        return hands
+        handedness_list = result.handedness or []
+        for i, hand_landmarks in enumerate(result.hand_landmarks):
+            label = "Hand"
+            if i < len(handedness_list) and handedness_list[i]:
+                # Tasks API: categories[0].category_name is "Left"/"Right"
+                cat = handedness_list[i][0]
+                name = getattr(cat, "category_name", None) or getattr(
+                    cat, "display_name", ""
+                )
+                label = self._normalize_hand_label(str(name))
+            points = [(lm.x, lm.y) for lm in hand_landmarks]
+            hands.append((label, points))
+        return self._dedupe_hand_labels(hands)
+
+    @staticmethod
+    def _dedupe_hand_labels(
+        hands: List[Tuple[str, List[NormPoint]]],
+    ) -> List[Tuple[str, List[NormPoint]]]:
+        """Ensure unique Left/Right labels; fall back to wrist x-order if needed."""
+        if len(hands) <= 1:
+            return hands
+        labels = [h[0] for h in hands]
+        if labels.count("Left") <= 1 and labels.count("Right") <= 1 and "Hand" not in labels:
+            return hands
+        # Sort by wrist x (landmark 0): leftmost in image -> Left
+        ordered = sorted(
+            hands,
+            key=lambda hp: hp[1][0][0] if hp[1] else 0.5,
+        )
+        out: List[Tuple[str, List[NormPoint]]] = []
+        if len(ordered) == 1:
+            return [("Right", ordered[0][1])]
+        out.append(("Left", ordered[0][1]))
+        out.append(("Right", ordered[1][1]))
+        for extra in ordered[2:]:
+            out.append((f"Hand{len(out)+1}", extra[1]))
+        return out
 
     def close(self) -> None:
         if self._legacy_hands is not None:
@@ -1003,21 +1060,34 @@ def draw_fingertip_pressures(
 def draw_finger_pressure_panel(
     frame: np.ndarray,
     tip_pressures: Sequence[Tuple[str, Tuple[int, int], float, float]],
+    title: str = "Fingertip press",
+    side: str = "right",
 ) -> None:
-    """Right-side panel of per-finger press bars."""
+    """Per-hand fingertip press bars. side: 'right' or 'left' of the frame."""
     if not tip_pressures:
         return
     h, w = frame.shape[:2]
-    panel_w = 220
-    x0 = w - panel_w - 16
+    panel_w = 210
+    margin = 16
+    if side == "left":
+        x0 = margin + 8
+    else:
+        x0 = w - panel_w - margin
     y0 = 90
-    cv2.rectangle(frame, (x0 - 8, y0 - 36), (w - 8, y0 + 28 * len(tip_pressures) + 8), (20, 20, 20), -1)
+    box_h = 28 * len(tip_pressures) + 44
+    cv2.rectangle(
+        frame,
+        (x0 - 8, y0 - 36),
+        (x0 + panel_w, y0 - 36 + box_h),
+        (20, 20, 20),
+        -1,
+    )
     cv2.putText(
         frame,
-        "Fingertip press",
+        title,
         (x0, y0 - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        0.6,
         (255, 255, 255),
         2,
         cv2.LINE_AA,
@@ -1034,17 +1104,17 @@ def draw_finger_pressure_panel(
             1,
             cv2.LINE_AA,
         )
-        bar_x = x0 + 70
-        bar_w = 110
+        bar_x = x0 + 60
+        bar_w = 100
         cv2.rectangle(frame, (bar_x, y), (bar_x + bar_w, y + 16), (60, 60, 60), -1)
-        fill = int(bar_w * tension)
+        fill = int(bar_w * np.clip(tension, 0.0, 1.0))
         color = (0, int(255 * (1.0 - tension)), int(255 * tension))
         if fill > 0:
             cv2.rectangle(frame, (bar_x, y), (bar_x + fill, y + 16), color, -1)
         cv2.putText(
             frame,
             f"{int(round(tension * 100))}%",
-            (bar_x + bar_w + 6, y + 13),
+            (bar_x + bar_w + 4, y + 13),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 255),
@@ -1373,11 +1443,24 @@ def main() -> int:
 
     fps_ema = 0.0
     last_t = time.perf_counter()
-    finger_smoother = FingerForceSmoother(
-        smooth=args.smooth,
-        adaptive=args.fpv_adaptive,
-        max_force=args.max_force,
-    )
+    # Separate smoothers so Left and Right hands don't overwrite each other.
+    finger_smoothers: dict[str, FingerForceSmoother] = {
+        "Left": FingerForceSmoother(
+            smooth=args.smooth, adaptive=args.fpv_adaptive, max_force=args.max_force
+        ),
+        "Right": FingerForceSmoother(
+            smooth=args.smooth, adaptive=args.fpv_adaptive, max_force=args.max_force
+        ),
+    }
+
+    def smoother_for(label: str) -> FingerForceSmoother:
+        if label not in finger_smoothers:
+            finger_smoothers[label] = FingerForceSmoother(
+                smooth=args.smooth,
+                adaptive=args.fpv_adaptive,
+                max_force=args.max_force,
+            )
+        return finger_smoothers[label]
 
     print(
         f"Streaming camera {camera_index} | device={device} | "
@@ -1417,18 +1500,28 @@ def main() -> int:
                 tensions: List[float] = []
 
                 if hands:
-                    all_tip_pressures: List[
-                        Tuple[str, Tuple[int, int], float, float]
-                    ] = []
-                    for points in hands:
-                        if len(points) < 21:
-                            # Still mark whatever tips we have.
-                            pass
+                    tips_by_hand: dict[str, List[Tuple[str, Tuple[int, int], float, float]]] = {}
+                    last_source = "—"
+                    last_stats = None
+                    for hand_label, points in hands:
                         if args.show_skeleton:
                             draw_hand_skeleton(display, points)
 
-                        # Always locate fingertips from MediaPipe first.
                         tips = fingertip_pixels(points, frame_w, frame_h)
+                        # Label which hand near the wrist.
+                        if points:
+                            wx = int(round(points[0][0] * frame_w))
+                            wy = int(round(points[0][1] * frame_h))
+                            cv2.putText(
+                                display,
+                                hand_label,
+                                (wx - 20, max(20, wy - 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                (255, 255, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
                         for i, (name, (px, py), _tid) in enumerate(tips):
                             color = FINGERTIP_COLORS[i % len(FINGERTIP_COLORS)]
                             cv2.circle(display, (px, py), 10, color, 2, cv2.LINE_AA)
@@ -1436,13 +1529,14 @@ def main() -> int:
                         bbox = landmarks_to_bbox(
                             points, frame_w, frame_h, padding=HAND_PADDING
                         )
+                        sm = smoother_for(hand_label)
                         if bbox is None:
                             zero_tips = [
                                 (name, xy, 0.0, 0.0) for name, xy, _tid in tips
                             ]
-                            zero_tips = finger_smoother.update(zero_tips)
+                            zero_tips = sm.update(zero_tips)
                             draw_fingertip_pressures(display, zero_tips)
-                            all_tip_pressures.extend(zero_tips)
+                            tips_by_hand[hand_label] = zero_tips
                             continue
 
                         x1, y1, x2, y2 = bbox
@@ -1461,18 +1555,16 @@ def main() -> int:
                                 soft=not args.hard_argmax,
                                 temperature=3.0,
                             )
-                        except Exception as exc:  # keep UI alive on a bad frame
-                            print(f"Inference error: {exc}", file=sys.stderr)
+                        except Exception as exc:
+                            print(f"Inference error ({hand_label}): {exc}", file=sys.stderr)
                             tip_pressures = pose_finger_press_proxy(
                                 points, frame_w, frame_h
                             )
-                            tip_pressures = finger_smoother.update(tip_pressures)
+                            tip_pressures = sm.update(tip_pressures)
                             draw_fingertip_pressures(display, tip_pressures)
-                            all_tip_pressures.extend(tip_pressures)
+                            tips_by_hand[hand_label] = tip_pressures
                             continue
 
-                        # Use contact-probability map for tip forces (0..1).
-                        # Fall back to pose curl when PV2 contact is dead.
                         overlay_heatmap_on_bbox(
                             display, contact_hm, bbox, alpha=0.55
                         )
@@ -1488,7 +1580,8 @@ def main() -> int:
                             points, frame_w, frame_h
                         )
                         pv2_alive = heat_stats.get("contact_peak", 0.0) > 0.03
-                        source = "pv2+pose" if pv2_alive else "pose-proxy"
+                        last_source = "pv2+pose" if pv2_alive else "pose-proxy"
+                        last_stats = heat_stats
                         merged: List[Tuple[str, Tuple[int, int], float, float]] = []
                         pose_by = {n: t for n, _xy, t, _r in pose_tips}
                         pix_by = {n: xy for n, xy, _t, _r in pose_tips}
@@ -1504,45 +1597,91 @@ def main() -> int:
                             merged.append((name, pix_by[name], t, r))
                         if not merged:
                             merged = pose_tips
-                        tip_pressures = finger_smoother.update(merged)
+                        tip_pressures = sm.update(merged)
                         draw_fingertip_pressures(display, tip_pressures)
-                        all_tip_pressures.extend(tip_pressures)
+                        tips_by_hand[hand_label] = tip_pressures
 
                         if tip_pressures:
-                            tensions.append(max(t for _n, _xy, t, _r in tip_pressures))
+                            tensions.append(
+                                max(t for _n, _xy, t, _r in tip_pressures)
+                            )
 
+                    if last_stats is not None:
                         cv2.putText(
                             display,
                             (
-                                f"contact={heat_stats.get('contact_peak', 0):.2f}  "
-                                f"p_max={heat_stats['p_contact_max']:.2f}  "
-                                f"logits={heat_stats.get('logit_span', 0):.1f}  "
-                                f"src={source}"
+                                f"contact={last_stats.get('contact_peak', 0):.2f}  "
+                                f"p_max={last_stats['p_contact_max']:.2f}  "
+                                f"src={last_source}  hands={len(tips_by_hand)}"
                             ),
                             (16, 128),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.55,
-                            (0, 255, 255) if pv2_alive else (0, 165, 255),
+                            (0, 255, 255)
+                            if last_source.startswith("pv2")
+                            else (0, 165, 255),
                             2,
                             cv2.LINE_AA,
                         )
 
-                    if all_tip_pressures:
-                        # One panel entry per finger name (max across hands).
-                        by_name: dict[str, Tuple[str, Tuple[int, int], float, float]] = {}
-                        for item in all_tip_pressures:
-                            name = item[0]
-                            if name not in by_name or item[2] > by_name[name][2]:
-                                by_name[name] = item
-                        ordered = [
-                            by_name[n] for n in FINGERTIP_NAMES if n in by_name
-                        ]
-                        draw_finger_pressure_panel(display, ordered)
-                        peak_tip = max(t for _n, _xy, t, _r in ordered)
+                    if tips_by_hand:
+                        # Left hand panel on the left, Right on the right.
+                        if "Left" in tips_by_hand:
+                            ordered_l = [
+                                next(
+                                    (
+                                        it
+                                        for it in tips_by_hand["Left"]
+                                        if it[0] == n
+                                    ),
+                                    (n, (0, 0), 0.0, 0.0),
+                                )
+                                for n in FINGERTIP_NAMES
+                            ]
+                            draw_finger_pressure_panel(
+                                display,
+                                ordered_l,
+                                title="LEFT hand",
+                                side="left",
+                            )
+                        if "Right" in tips_by_hand:
+                            ordered_r = [
+                                next(
+                                    (
+                                        it
+                                        for it in tips_by_hand["Right"]
+                                        if it[0] == n
+                                    ),
+                                    (n, (0, 0), 0.0, 0.0),
+                                )
+                                for n in FINGERTIP_NAMES
+                            ]
+                            draw_finger_pressure_panel(
+                                display,
+                                ordered_r,
+                                title="RIGHT hand",
+                                side="right",
+                            )
+                        # Any extra unlabeled hands: stack under right panel title.
+                        for label, tips in tips_by_hand.items():
+                            if label in ("Left", "Right"):
+                                continue
+                            draw_finger_pressure_panel(
+                                display,
+                                tips,
+                                title=f"{label} hand",
+                                side="right",
+                            )
+
+                        peak_tip = max(
+                            t
+                            for tips in tips_by_hand.values()
+                            for _n, _xy, t, _r in tips
+                        )
                         draw_tension_bar(
                             display,
                             peak_tip,
-                            label="Fingertip Press / Grip Tension",
+                            label="Both hands — peak fingertip press",
                         )
                     elif tensions:
                         draw_tension_bar(
