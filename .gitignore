@@ -6,3 +6,12 @@ weights/camera_previews/
 .DS_Store
 *.mkv
 data/sessions/
+data/multicam_force/raw/
+data/multicam_force/train/
+data/multicam_force/val/
+data/multicam_force/yolo_pose/
+data/pose_estimates/
+calibration/pad_markers.json
+calibration/camera_probe.json
+*.pyc
+.pytest_cache/

@@ -9,3 +9,5 @@ pyyaml
 pretrainedmodels
 efficientnet-pytorch
 timm
+# Optional: YOLO-pose training on multicam force exports
+# ultralytics

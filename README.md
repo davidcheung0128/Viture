@@ -225,6 +225,20 @@ Viture/
 
 ---
 
+## 7-camera + pressure-pad dataset (YOLO-pose force)
+
+On branch **`cursor/multicam-force-yolo-4841`**, use the multi-cam toolkit to calibrate the pad and build a dataset so YOLO-pose (and PressureVision++) learn real contact force:
+
+```bash
+git checkout cursor/multicam-force-yolo-4841
+python scripts/list_cameras.py
+python scripts/calibrate_pad_markers.py
+python scripts/record_multicam_force.py --participant p01 --action one_finger_index_high --seconds 3
+python scripts/build_force_pose_dataset.py --raw-root data/multicam_force/raw --split train
+```
+
+Full guide: [`docs/MULTICAM_FORCE_DATASET.md`](docs/MULTICAM_FORCE_DATASET.md). Dry-run with `pad.backend: mock` before wiring Tekscan.
+
 ## Later: custom Orbbec + Tekscan training
 
-When your 7× Femto Bolt + Sync Hub Pro + Tekscan 5330 rig is ready, collect synced multi-view RGB-D + pressure ground truth and finetune `paper_29.pth` for accurate absolute per-finger force. Until then, use this live tracker for dual-hand relative grip feedback.
+When your 7× Femto Bolt + Sync Hub Pro + Tekscan 5330 rig is ready, collect synced multi-view RGB-D + pressure ground truth (scripts above) and finetune `paper_29.pth` / YOLO-pose for accurate absolute per-finger force. Until then, use this live tracker for dual-hand relative grip feedback.

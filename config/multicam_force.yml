@@ -1,0 +1,85 @@
+# 7-camera + pressure-pad dataset config for YOLO-pose force labels
+
+# Camera indices (OpenCV). Override on CLI if your machine differs.
+# Typical Orbbec Femto Bolt / UVC layout: fill after `python scripts/list_cameras.py`
+cameras:
+  - id: "0"
+    index: 0
+    name: cam0
+  - id: "1"
+    index: 1
+    name: cam1
+  - id: "2"
+    index: 2
+    name: cam2
+  - id: "3"
+    index: 3
+    name: cam3
+  - id: "4"
+    index: 4
+    name: cam4
+  - id: "5"
+    index: 5
+    name: cam5
+  - id: "6"
+    index: 6
+    name: cam6
+
+recording:
+  target_fps: 20
+  sync_tolerance_ms: 20
+  image_ext: jpg
+  jpeg_quality: 90
+
+# Pressure pad (Tekscan 5330-class defaults — edit to match your sheet)
+pad:
+  backend: mock   # mock | tekscan
+  rows: 64
+  cols: 256
+  # Active sensing area in millimetres (width x height)
+  width_mm: 203.2
+  height_mm: 76.2
+  # Counts → Newtons scale (document after pad calibration / vendor datasheet)
+  counts_per_newton: 1736
+  pixel_pitch_m: 0.00125
+
+# ArUco board around the pad (DICT_4X4_50 by default)
+aruco:
+  dictionary: DICT_4X4_50
+  # Marker IDs placed at pad corners in board order: TL, TR, BR, BL
+  corner_marker_ids: [0, 1, 2, 3]
+  marker_length_m: 0.04
+
+# Force class bins (kPa) — match PressureVision++ for PV2 finetune
+force_thresholds_kpa:
+  - 0.0
+  - 0.5
+  - 1.0
+  - 2.0
+  - 4.0
+  - 8.0
+  - 16.0
+  - 32.0
+  - 64.0
+
+# YOLO-pose hand export (MediaPipe 21 landmarks)
+yolo_pose:
+  # Ultralytics keypoint order: MediaPipe Hands (21)
+  num_keypoints: 21
+  # Fingertip landmark indices in MediaPipe order
+  fingertips:
+    thumb: 4
+    index: 8
+    middle: 12
+    ring: 16
+    pinky: 20
+  # Radius (px) around fingertip to sample mean pressure
+  tip_sample_radius_px: 12
+  contact_thresh_kpa: 1.0
+
+paths:
+  calibration: calibration/pad_markers.json
+  raw_root: data/multicam_force/raw
+  train_root: data/multicam_force/train
+  val_root: data/multicam_force/val
+  yolo_root: data/multicam_force/yolo_pose
