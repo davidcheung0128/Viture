@@ -1,5 +1,9 @@
 # 7-camera + pressure-pad dataset config for YOLO-pose force labels
 
+# Orbbec Sync Hub: power the hub first, then open cameras so OpenCV indices stay stable.
+# Hardware sync aligns the 7 camera shutters; pressure-pad sync still uses host timestamps
+# (recording.sync_tolerance_ms below). Keep the pad on the same PC as the Sync Hub host.
+
 # Camera indices (OpenCV). Override on CLI if your machine differs.
 # Typical Orbbec Femto Bolt / UVC layout: fill after `python scripts/list_cameras.py`
 cameras:
@@ -30,6 +34,8 @@ recording:
   sync_tolerance_ms: 20
   image_ext: jpg
   jpeg_quality: 90
+  # Set true in notes when using Orbbec Sync Hub (camera-camera alignment)
+  orbbec_sync_hub: true
 
 # Pressure pad (Tekscan 5330-class defaults — edit to match your sheet)
 pad:

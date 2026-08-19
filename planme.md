@@ -45,6 +45,55 @@ Measure once: pad active size (mm), grid rows×cols, counts→Newtons scale.
 
 ---
 
+## 1b. You have 7 cams + Orbbec Sync Hub — start now
+
+**Yes — the Sync Hub helps a lot.** It hardware-aligns the seven camera shutters so every view of the same press lines up. That makes multi-view YOLO-pose / force labels far cleaner than free-running USB cams.
+
+What the Sync Hub does **not** do: it does not sync the pressure pad. The pad still joins via the **same PC clock** (`time.time_ns()` in `v2_collect.py`, ±20 ms tolerance). Keep the pad on the same machine as the Sync Hub host.
+
+### First-day order (do this once)
+
+1. **Power / cabling** — Sync Hub Pro powered; all 7 Femto Bolts on the hub; host sees them (Orbbec Viewer or OS camera list). Avoid Continuity/iPhone stealing an index.
+2. **Map OpenCV indices**
+
+   ```bash
+   git checkout V2
+   python scripts/list_cameras.py
+   ```
+
+   Open `weights/camera_previews/`. You want **7 non-black** feeds. Write those indices into `config/multicam_force.yml` (`cameras[0..6].index`). Give each a clear `name` (e.g. `top`, `front`, `left`, …).
+3. **Link check (mock pad is fine for this step)**
+
+   ```bash
+   python scripts/v2_collect.py --participant p01 --backend mock --require-cameras 7
+   ```
+
+   Live mosaic should show all 7 cams + a FORCE tile. If any cam is missing, fix hub/USB/index before recording real data.
+4. **Pad**
+   - If Tekscan SDK is ready → implement `forcepad/tekscan_device.py`, then `--backend tekscan`, tare with empty pad (`t`).
+   - If pad SDK not ready yet → keep collecting with `--backend mock` only to stress-test the 7-cam path; **do not** use mock force for final training labels.
+5. **ArUco on the pad** → `python scripts/calibrate_pad_markers.py` (press `s` on each cam when the green quad is correct).
+6. **First real session** — scripted finger presses (section 4), ~10–20 takes, then:
+
+   ```bash
+   python scripts/v2_collect.py --participant p01 --backend tekscan --auto-build
+   python scripts/qc_force_overlay.py --seq data/multicam_force/train/p01/<action> --camera-id 0
+   ```
+
+### Sync Hub tips while collecting
+
+| Do | Why |
+|----|-----|
+| Start hub + cameras before opening OpenCV | Indices stay stable |
+| Record with all 7 linked (don’t drop to 1 cam mid-study) | Train/val stay multi-view |
+| Keep pad USB on the **same** PC as the hub host | Host-clock sync to force |
+| Prefer 15–20 FPS target in config | Disk + match rate stay healthy |
+| Spot-check one QC overlay per action | Blob must sit under the fingertip |
+
+When this checklist is green, you are past setup — start the action list in §4 and fill the frame budget in §4.
+
+---
+
 ## 2. Software checklist
 
 ```bash
