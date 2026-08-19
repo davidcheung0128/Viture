@@ -101,37 +101,55 @@ class MockPressurePad(PressurePad):
 
 class TekscanPressurePad(PressurePad):
     """
-    Stub for a real Tekscan SDK / CSV / Evolution handle.
+    Real Tekscan backend.
 
-    Wire your vendor SDK here so `read_frame()` returns the live pressure grid.
-    Until then, raise on open() with install instructions.
+    Prefers `forcepad.tekscan_device.TekscanDevice` if you implement it;
+    otherwise tries a vendor module named `tekscan_sdk`.
     """
 
     def __init__(self, spec: PadSpec, device: Optional[str] = None):
         super().__init__(spec)
         self.device = device
-        self._handle = None
+        self._impl = None
 
     def open(self) -> None:
         try:
-            # Placeholder: users replace this with vendor Python bindings.
+            from forcepad.tekscan_device import TekscanDevice
+
+            self._impl = TekscanDevice(self.spec, self.device)
+            self._impl.open()
+            return
+        except NotImplementedError:
+            self._impl = None
+        except Exception:
+            self._impl = None
+
+        try:
             import tekscan_sdk  # type: ignore  # noqa: F401
         except ImportError as exc:
             raise ImportError(
-                "Tekscan backend selected but no vendor SDK is importable.\n"
-                "Install your Tekscan / I-Scan / Evolution Python bindings, then\n"
-                "implement open()/read_frame()/tare() in forcepad/tekscan_pad.py,\n"
-                "or dry-run with pad.backend: mock in config/multicam_force.yml."
+                "Tekscan backend selected but no device implementation is ready.\n"
+                "1) Edit forcepad/tekscan_device.py (open/tare/read_frame), or\n"
+                "2) Install vendor bindings as tekscan_sdk, or\n"
+                "3) Dry-run with: python scripts/v2_collect.py --dry-run\n"
+                "   / set pad.backend: mock in config/multicam_force.yml"
             ) from exc
+        raise NotImplementedError("tekscan_sdk is importable — wrap it in forcepad/tekscan_device.py")
 
     def close(self) -> None:
-        self._handle = None
+        if self._impl is not None:
+            self._impl.close()
+        self._impl = None
 
     def tare(self) -> None:
-        raise NotImplementedError("Implement tare() with your Tekscan SDK")
+        if self._impl is None:
+            raise RuntimeError("Tekscan pad not open")
+        self._impl.tare()
 
     def read_frame(self) -> Tuple[np.ndarray, int]:
-        raise NotImplementedError("Implement read_frame() with your Tekscan SDK")
+        if self._impl is None:
+            raise RuntimeError("Tekscan pad not open")
+        return self._impl.read_frame()
 
 
 def make_pad(backend: str, spec: PadSpec, **kwargs) -> PressurePad:

@@ -225,19 +225,21 @@ Viture/
 
 ---
 
-## 7-camera + pressure-pad dataset (YOLO-pose force)
+## V2 — 7 cameras + pressure pad → train data
 
-On branch **`cursor/multicam-force-yolo-4841`**, use the multi-cam toolkit to calibrate the pad and build a dataset so YOLO-pose (and PressureVision++) learn real contact force:
+On branch **`V2`**, link seven cameras and a pressure pad, record synced takes, and export YOLO-pose + force labels:
 
 ```bash
-git checkout cursor/multicam-force-yolo-4841
-python scripts/list_cameras.py
+git checkout V2
+python scripts/v2_collect.py --dry-run --participant p01 --auto-build   # no hardware
+python scripts/list_cameras.py                                         # map your 7 cams
+python scripts/v2_collect.py --participant p01 --backend mock          # real cams
+# after wiring Tekscan SDK:
 python scripts/calibrate_pad_markers.py
-python scripts/record_multicam_force.py --participant p01 --action one_finger_index_high --seconds 3
-python scripts/build_force_pose_dataset.py --raw-root data/multicam_force/raw --split train
+python scripts/v2_collect.py --participant p01 --backend tekscan --auto-build
 ```
 
-Full guide: [`docs/MULTICAM_FORCE_DATASET.md`](docs/MULTICAM_FORCE_DATASET.md). Dry-run with `pad.backend: mock` before wiring Tekscan.
+Start here: [`V2_README.md`](V2_README.md). Details: [`docs/MULTICAM_FORCE_DATASET.md`](docs/MULTICAM_FORCE_DATASET.md).
 
 ## Later: custom Orbbec + Tekscan training
 
